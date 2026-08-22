@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Village Pond Planning System</title>
+
+  <!-- Leaflet CSS/JS from a free CDN -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <div id="app">
+    <aside id="sidebar">
+      <h1>🌾 Village Pond Planner</h1>
+
+      <div class="panel">
+        <label for="village-search">Search village</label>
+        <div class="search-row">
+          <input type="text" id="village-search" placeholder="e.g. Nagpur" />
+          <button id="search-btn">Search</button>
+        </div>
+        <p id="search-status" class="status-text"></p>
+      </div>
+
+      <div class="panel">
+        <label>Map layer</label>
+        <div class="layer-toggle">
+          <button id="layer-street" class="layer-btn active">Street</button>
+          <button id="layer-satellite" class="layer-btn">Satellite</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <button id="contours-btn" class="layer-btn full-width" disabled>Show Contours</button>
+        <p class="hint">Search a village first, then load its contour lines (may take 10-20s).</p>
+        <div id="contour-legend" class="contour-legend hidden">
+          <span class="legend-label">Low</span>
+          <div class="legend-gradient"></div>
+          <span class="legend-label">High</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <p class="hint">Click anywhere on the map to select a candidate pond site.</p>
+      </div>
+
+      <div id="results-panel" class="panel results hidden">
+        <h2>Site Summary</h2>
+        <div id="results-content"></div>
+      </div>
+    </aside>
+
+    <main id="map"></main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/map.js"></script>
+</body>
+</html>
