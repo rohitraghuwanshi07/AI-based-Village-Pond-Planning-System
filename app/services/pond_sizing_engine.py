@@ -9,6 +9,7 @@ import math
 # Reasonable engineering defaults for small village earthen ponds
 MIN_DEPTH_M = 1.5
 MAX_DEPTH_M = 4.0
+PREFERRED_DEPTH_M = 2.5  # typical depth for a small rural water-harvesting pond
 SIDE_SLOPE_RATIO = 1.5  # horizontal:vertical, e.g. 1.5:1 -- a common stable slope for earthen embankments
 
 
@@ -71,17 +72,31 @@ def recommend_pond(
     # leaving a margin for embankments/access (use at most 70% of the site).
     max_usable_area_m2 = available_site_area_m2 * 0.7
 
-    # Try depths from shallow to deep. At each depth, first check whether the
-    # target is even achievable using the maximum usable area -- only if so
-    # do we binary-search for the minimal (cheaper-to-excavate) area that
-    # meets the target at that depth.
+    # Search depths starting from a REALISTIC preferred depth (2.5m -- typical
+    # for a small village pond), deepening only if the site can't fit the
+    # preferred depth's footprint, and only falling back to shallower depths
+    # if even the maximum depth doesn't fit. We deliberately do NOT default to
+    # the shallowest possible depth: a very shallow, sprawling pond (e.g. 1.5m
+    # deep spread over a huge footprint) is impractical in reality -- more
+    # evaporation loss per m3 stored, more land disturbed, and not what an
+    # actual village pond looks like, even though it technically "achieves"
+    # the target volume on paper.
+    depth_search_order = []
+    d = PREFERRED_DEPTH_M
+    while d <= MAX_DEPTH_M + 1e-9:
+        depth_search_order.append(round(d, 2))
+        d += 0.25
+    d = PREFERRED_DEPTH_M - 0.25
+    while d >= MIN_DEPTH_M - 1e-9:
+        depth_search_order.append(round(d, 2))
+        d -= 0.25
+
     best_depth = None
     best_area = None
     best_volume = 0.0
     site_sufficient = False
 
-    for depth_cm in range(int(MIN_DEPTH_M * 100), int(MAX_DEPTH_M * 100) + 1, 25):
-        depth = depth_cm / 100
+    for depth in depth_search_order:
         max_possible_volume = trapezoidal_volume_m3(max_usable_area_m2, depth)
 
         if max_possible_volume >= target_volume_m3:
@@ -98,7 +113,7 @@ def recommend_pond(
             best_area = area_high
             best_volume = trapezoidal_volume_m3(best_area, depth)
             site_sufficient = True
-            break  # shallowest depth that fits wins
+            break  # first depth tried, in our preferred-depth-first order, that fits
 
     if not site_sufficient:
         # Target isn't achievable at any depth up to MAX_DEPTH_M with the

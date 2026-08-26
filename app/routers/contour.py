@@ -33,8 +33,9 @@ from app.services.pond_site_selector import select_pond_site
 from app.services.rainfall_client import get_historical_rainfall
 from app.services.runoff_engine import estimate_daily_series_runoff, DEFAULT_CURVE_NUMBER, CURVE_NUMBERS
 from app.services.land_use_client import fetch_obstructions
-from app.services.site_suitability import compute_available_site_area
+from app.services.site_suitability import find_vacant_patches
 from app.services.pond_sizing_engine import recommend_pond
+from app.services.soil_client import fetch_soil_composition
 
 router = APIRouter(tags=["contour-analysis"])
 
@@ -105,7 +106,7 @@ async def _analyze_contour_impl(
     timings["flow_analysis_seconds"] = round(time.time() - t, 2)
 
     t = time.time()
-    row, col, site_info = select_pond_site(slope, acc, max_slope_deg=max_slope_deg)
+    row, col, site_info = select_pond_site(slope, acc, elevation=elevation, max_slope_deg=max_slope_deg)
     timings["site_selection_seconds"] = round(time.time() - t, 2)
 
     t = time.time()
@@ -118,25 +119,53 @@ async def _analyze_contour_impl(
     catchment_area_m2 = float(catchment_mask.sum()) * cell_area_m2
 
     # --- Real pond sizing, grounded in actual land availability (not a guess) ---
-    # This checks real OpenStreetMap building/road data near the selected site,
-    # so the recommended pond footprint isn't placed on top of real structures.
+    # This checks real OpenStreetMap building/road/water data near the selected
+    # site and finds genuinely CONTIGUOUS vacant land -- patches split apart by
+    # a road are treated as separate, not combined into one leftover number.
     t = time.time()
     site_check = None
+    vacant_land_boundary_geojson = None
     obstruction_data = await fetch_obstructions(site_lat, site_lon, radius_m=150.0)
     if obstruction_data["query_succeeded"]:
-        site_check = compute_available_site_area(
+        patch_result = find_vacant_patches(
             site_lat, site_lon,
             buildings=obstruction_data["buildings"],
             roads=obstruction_data["roads"],
+            water=obstruction_data["water"],
             search_radius_m=150.0,
         )
-        available_area_m2 = site_check["available_area_m2"]
+        if patch_result["patches"] and patch_result["selected_patch_index"] is not None:
+            selected_patch = patch_result["patches"][patch_result["selected_patch_index"]]
+            available_area_m2 = selected_patch["area_m2"]
+            vacant_land_boundary_geojson = selected_patch["boundary_geojson"]
+            site_check = {
+                "available_area_m2": available_area_m2,
+                "buildings_found_nearby": patch_result["buildings_found_nearby"],
+                "roads_found_nearby": patch_result["roads_found_nearby"],
+                "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
+                "total_separate_patches_found": len(patch_result["patches"]),
+                "note": (
+                    f"Selected the contiguous vacant patch actually containing/nearest to the "
+                    f"selected site ({available_area_m2} m2), out of {len(patch_result['patches'])} "
+                    f"separate open patch(es) found nearby."
+                ),
+            }
+        else:
+            available_area_m2 = 0.0
+            site_check = {
+                "available_area_m2": 0.0,
+                "note": "No usable vacant land patch found within 150m of the selected site.",
+            }
     else:
-        available_area_m2 = 5000.0
+        search_radius_m = 150.0
+        assumed_open_fraction = 0.6
+        available_area_m2 = round(3.14159 * (search_radius_m ** 2) * assumed_open_fraction, 1)
         site_check = {
             "available_area_m2": available_area_m2,
             "note": f"OpenStreetMap obstruction check failed ({obstruction_data['error']}); "
-                    f"using a conservative fallback. Verify this site manually before construction.",
+                    f"assuming {int(assumed_open_fraction*100)}% of the {search_radius_m:.0f}m search "
+                    f"radius is open land (unverified). Confirm this site is actually clear of "
+                    f"buildings/roads/water before construction.",
         }
     timings["land_use_check_seconds"] = round(time.time() - t, 2)
 
@@ -160,6 +189,10 @@ async def _analyze_contour_impl(
     )
     avg_annual_runoff_volume_m3 = (avg_annual_runoff_depth_mm / 1000) * catchment_area_m2
     timings["rainfall_runoff_seconds"] = round(time.time() - t, 2)
+
+    t = time.time()
+    soil_check = await fetch_soil_composition(site_lat, site_lon)
+    timings["soil_check_seconds"] = round(time.time() - t, 2)
 
     pond_sizing = recommend_pond(
         required_volume_m3=avg_annual_runoff_volume_m3,
@@ -202,6 +235,8 @@ async def _analyze_contour_impl(
             "avg_annual_runoff_volume_m3": round(avg_annual_runoff_volume_m3, 1),
         },
         "site_check": site_check,
+        "vacant_land_boundary_geojson": vacant_land_boundary_geojson,
+        "soil_check": soil_check,
         "pond_sizing_recommendation": pond_sizing,
         "methodology": (
             "Contour lines were parsed from the uploaded file and interpolated into a "

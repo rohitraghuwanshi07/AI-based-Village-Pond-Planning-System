@@ -49,7 +49,6 @@ async function getPondRecommendation(south, north, west, east, pourLat, pourLon,
     south, north, west, east,
     pour_lat: pourLat, pour_lon: pourLon,
     land_cover: options.landCover || "cultivated_land",
-    available_site_area_m2: options.siteAreaM2 || 20000,
     target_capture_fraction: options.targetFraction || 0.5,
   });
   const url = `${API_BASE}/api/pond/recommend?${params.toString()}`;
@@ -57,6 +56,21 @@ async function getPondRecommendation(south, north, west, east, pourLat, pourLon,
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
     throw new Error(body.detail || `Pond recommendation failed (${resp.status})`);
+  }
+  return resp.json();
+}
+
+async function suggestPondSite(south, north, west, east, options = {}) {
+  const params = new URLSearchParams({
+    south, north, west, east,
+    land_cover: options.landCover || "cultivated_land",
+    target_capture_fraction: options.targetFraction || 0.5,
+  });
+  const url = `${API_BASE}/api/pond/suggest-site?${params.toString()}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.detail || `Site suggestion failed (${resp.status})`);
   }
   return resp.json();
 }

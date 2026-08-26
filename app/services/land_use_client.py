@@ -1,9 +1,9 @@
 """
-Fetches real buildings and roads near a candidate pond site from OpenStreetMap's
-free Overpass API, so we can check whether a proposed pond footprint would
-actually collide with existing structures -- instead of blindly assuming a
-fixed amount of open land exists, which was the root cause of pond footprints
-being recommended right on top of real buildings/roads.
+Fetches real buildings, roads, and water bodies near a candidate pond site
+from OpenStreetMap's free Overpass API, so we can check whether a proposed
+pond footprint would actually collide with existing structures or an
+existing water body -- instead of blindly assuming a fixed amount of open
+land exists.
 
 Docs: https://wiki.openstreetmap.org/wiki/Overpass_API
 Public endpoint, free, no API key required.
@@ -14,15 +14,23 @@ from shapely.geometry import LineString, Polygon
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+HEADERS = {
+    "User-Agent": "village-pond-planner-student-project (contact: student@example.com)",
+    "Accept": "application/json",
+    "Content-Type": "application/x-www-form-urlencoded",
+}
+
 
 async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) -> dict:
     """
-    Query OpenStreetMap for buildings and roads within radius_m of (lat, lon).
+    Query OpenStreetMap for buildings, roads, and water bodies within
+    radius_m of (lat, lon).
 
     Returns:
         {
           "buildings": [shapely Polygon, ...],
           "roads": [shapely LineString, ...],
+          "water": [shapely Polygon or LineString, ...],
           "query_succeeded": bool,
           "error": str or None,
         }
@@ -32,10 +40,14 @@ async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) ->
     not silently pretend the land is empty.
     """
     query = f"""
-    [out:json][timeout:20];
+    [out:json][timeout:25];
     (
       way["building"](around:{radius_m},{lat},{lon});
       way["highway"](around:{radius_m},{lat},{lon});
+      way["natural"="water"](around:{radius_m},{lat},{lon});
+      way["landuse"="reservoir"](around:{radius_m},{lat},{lon});
+      way["waterway"](around:{radius_m},{lat},{lon});
+      relation["natural"="water"](around:{radius_m},{lat},{lon});
     );
     out body;
     >;
@@ -43,12 +55,12 @@ async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) ->
     """
 
     try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": query})
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(OVERPASS_URL, data={"data": query}, headers=HEADERS)
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        return {"buildings": [], "roads": [], "query_succeeded": False, "error": str(e)}
+        return {"buildings": [], "roads": [], "water": [], "query_succeeded": False, "error": str(e)}
 
     nodes = {}
     ways = []
@@ -58,22 +70,36 @@ async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) ->
         elif el["type"] == "way":
             ways.append(el)
 
-    buildings, roads = [], []
+    buildings, roads, water = [], [], []
     for way in ways:
         coords = [nodes[n] for n in way.get("nodes", []) if n in nodes]
         if len(coords) < 2:
             continue
         tags = way.get("tags", {})
+
+        is_water = tags.get("natural") == "water" or tags.get("landuse") == "reservoir" or "waterway" in tags
+
         if "building" in tags:
             if len(coords) >= 3:
                 try:
                     buildings.append(Polygon(coords))
                 except Exception:
                     pass
+        elif is_water:
+            if len(coords) >= 3 and coords[0] == coords[-1]:
+                try:
+                    water.append(Polygon(coords))
+                    continue
+                except Exception:
+                    pass
+            try:
+                water.append(LineString(coords))
+            except Exception:
+                pass
         elif "highway" in tags:
             try:
                 roads.append(LineString(coords))
             except Exception:
                 pass
 
-    return {"buildings": buildings, "roads": roads, "query_succeeded": True, "error": None}
+    return {"buildings": buildings, "roads": roads, "water": water, "query_succeeded": True, "error": None}

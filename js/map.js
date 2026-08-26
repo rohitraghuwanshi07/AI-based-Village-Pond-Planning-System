@@ -26,6 +26,7 @@ let siteMarker = null;
 let contourLayer = null;
 let catchmentLayer = null;
 let pondFootprintLayer = null;
+let vacantLandLayer = null;
 let lastVillageBbox = null;
 
 // ---- Layer toggle buttons ----
@@ -75,6 +76,7 @@ async function handleSearch() {
     searchStatus.textContent = `Found: ${result.name}`;
     lastVillageBbox = result.bbox;
     document.getElementById("contours-btn").disabled = false;
+    document.getElementById("suggest-site-btn").disabled = false;
   } catch (err) {
     searchStatus.textContent = err.message;
     searchStatus.classList.add("error");
@@ -111,68 +113,126 @@ function bboxAroundPoint(lat, lon, halfSize = ANALYSIS_HALF_SIZE_DEG) {
 
 map.on("click", async (e) => {
   const { lat, lng } = e.latlng;
+  await analyzeAndRender(lat, lng, /*isAutoSuggested=*/ false);
+});
 
+// Shared rendering used by both a manual map click and the auto "Suggest Best Site" button.
+async function analyzeAndRender(lat, lng, isAutoSuggested, autoSelectedInfo = null) {
   if (siteMarker) map.removeLayer(siteMarker);
   siteMarker = L.marker([lat, lng], {
-    icon: L.divIcon({ className: "site-marker", html: "📍", iconSize: [24, 24] }),
+    icon: L.divIcon({ className: "site-marker", html: isAutoSuggested ? "⭐" : "📍", iconSize: [24, 24] }),
   }).addTo(map);
 
   resultsPanel.classList.remove("hidden");
-  resultsContent.innerHTML = `<p class="hint">Analyzing catchment, rainfall, runoff, and pond sizing... (this can take 15-40s)</p>`;
+  resultsContent.innerHTML = `<p class="hint">Analyzing catchment, rainfall, runoff, soil, and pond sizing... (this can take 15-40s)</p>`;
 
   try {
     const { south, north, west, east } = bboxAroundPoint(lat, lng);
     const rec = await getPondRecommendation(south, north, west, east, lat, lng);
-
-    if (catchmentLayer) map.removeLayer(catchmentLayer);
-    catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
-      style: { color: "#2c5a3d", weight: 2, fillColor: "#4a90d9", fillOpacity: 0.25 },
-    }).addTo(map);
-
-    const p = rec.pond_recommendation;
-
-    // Draw the actual proposed pond footprint (a small square centered on the
-    // click) so you can visually see, on satellite imagery, whether it lands
-    // on open land or overlaps something -- this is the piece that was
-    // missing before, making the mismatch invisible until you looked closely.
-    if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
-    const sideMeters = Math.sqrt(p.recommended_surface_area_m2);
-    const halfSideDegLat = (sideMeters / 2) / 111320;
-    const halfSideDegLon = (sideMeters / 2) / (111320 * Math.cos(lat * Math.PI / 180));
-    pondFootprintLayer = L.rectangle(
-      [[lat - halfSideDegLat, lng - halfSideDegLon], [lat + halfSideDegLat, lng + halfSideDegLon]],
-      { color: "#d9534f", weight: 2, fillColor: "#d9534f", fillOpacity: 0.4 }
-    ).addTo(map).bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
-    const sufficiencyNote = p.site_area_sufficient_for_target
-      ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction*100).toFixed(0)}% capture target</span>`
-      : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
-
-    const catchmentClippedNote = rec.catchment.area_hectares > (2 * ANALYSIS_HALF_SIZE_DEG * 111) * (2 * ANALYSIS_HALF_SIZE_DEG * 111) * 0.9
-      ? `<p class="hint" style="color:#b3841a;">Note: this catchment may extend beyond our ${(ANALYSIS_HALF_SIZE_DEG*2*111).toFixed(0)}km analysis window and could be larger than shown.</p>`
-      : "";
-
-    const sc = rec.site_check;
-    const siteCheckNote = sc && sc.note
-      ? `<p class="hint" style="color:#b3413a;">⚠ ${sc.note}</p>`
-      : sc
-      ? `<p class="hint">Checked ${sc.buildings_found_nearby} building(s) and ${sc.roads_found_nearby} road(s) within ${sc.search_radius_m}m — ${sc.percent_of_search_area_open}% of nearby land is open (OpenStreetMap data).</p>`
-      : "";
-
-    resultsContent.innerHTML = `
-      <div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>
-      <div class="result-row"><span class="label">Avg annual rainfall</span><span class="value">${rec.rainfall.annual_average_mm} mm</span></div>
-      <div class="result-row"><span class="label">Catchment area</span><span class="value">${rec.catchment.area_hectares} ha</span></div>
-      <div class="result-row"><span class="label">Curve number (land cover)</span><span class="value">${rec.runoff.curve_number_used} (${rec.runoff.land_cover_assumed})</span></div>
-      <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>
-      <div class="result-row"><span class="label">Recommended depth</span><span class="value">${p.recommended_depth_m} m</span></div>
-      <div class="result-row"><span class="label">Recommended surface area</span><span class="value">${p.recommended_surface_area_m2.toLocaleString()} m²</span></div>
-      <div class="result-row"><span class="label">Storage capacity</span><span class="value">${p.achievable_storage_capacity_m3.toLocaleString()} m³</span></div>
-      <p class="hint" style="margin-top:12px;">${sufficiencyNote}</p>
-      ${siteCheckNote}
-      ${catchmentClippedNote}
-    `;
+    renderSiteSummary(rec, lat, lng, autoSelectedInfo);
   } catch (err) {
     resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
+  }
+}
+
+function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
+  if (catchmentLayer) map.removeLayer(catchmentLayer);
+  catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
+    style: { color: "#2c5a3d", weight: 2, fillColor: "#4a90d9", fillOpacity: 0.25 },
+  }).addTo(map);
+
+  const p = rec.pond_recommendation;
+
+  // Draw the REAL usable vacant land boundary (buildings/roads/water already
+  // excluded, and separate patches split by a road are shown as separate
+  // shapes, not merged) -- this is the actual buildable area, distinct from
+  // both the huge catchment polygon and the small proposed pond square.
+  if (vacantLandLayer) map.removeLayer(vacantLandLayer);
+  if (rec.vacant_land_boundary_geojson) {
+    vacantLandLayer = L.geoJSON(rec.vacant_land_boundary_geojson, {
+      style: { color: "#8a5a2b", weight: 2, fillColor: "#e8d5a8", fillOpacity: 0.35, dashArray: "6,4" },
+    }).addTo(map).bindPopup("Usable vacant land (buildings/roads/water excluded)");
+  }
+
+  if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
+  const sideMeters = Math.sqrt(p.recommended_surface_area_m2);
+  const halfSideDegLat = (sideMeters / 2) / 111320;
+  const halfSideDegLon = (sideMeters / 2) / (111320 * Math.cos(lat * Math.PI / 180));
+  pondFootprintLayer = L.rectangle(
+    [[lat - halfSideDegLat, lng - halfSideDegLon], [lat + halfSideDegLat, lng + halfSideDegLon]],
+    { color: "#d9534f", weight: 2, fillColor: "#d9534f", fillOpacity: 0.4 }
+  ).addTo(map).bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
+
+  const sufficiencyNote = p.site_area_sufficient_for_target
+    ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction*100).toFixed(0)}% capture target</span>`
+    : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
+
+  const catchmentClippedNote = rec.catchment.area_hectares > (2 * ANALYSIS_HALF_SIZE_DEG * 111) * (2 * ANALYSIS_HALF_SIZE_DEG * 111) * 0.9
+    ? `<p class="hint" style="color:#b3841a;">Note: this catchment may extend beyond our ${(ANALYSIS_HALF_SIZE_DEG*2*111).toFixed(0)}km analysis window and could be larger than shown.</p>`
+    : "";
+
+  const sc = rec.site_check;
+  const siteCheckNote = sc && sc.total_separate_patches_found !== undefined
+    ? `<p class="hint">Found ${sc.total_separate_patches_found} separate open patch(es) nearby (${sc.buildings_found_nearby} building(s), ${sc.roads_found_nearby} road(s), ${sc.water_bodies_found_nearby || 0} water body/ies excluded). Using the ${sc.available_area_m2.toLocaleString()} m² patch closest to this site.</p>`
+    : sc && sc.note
+    ? `<p class="hint" style="color:#b3413a;">⚠ ${sc.note}</p>`
+    : "";
+
+  const soil = rec.soil_check;
+  const soilNote = soil && soil.query_succeeded
+    ? `<div class="result-row"><span class="label">Soil (sand/silt/clay)</span><span class="value">${soil.sand_pct}% / ${soil.silt_pct}% / ${soil.clay_pct}%</span></div>
+       <div class="result-row"><span class="label">Seepage risk</span><span class="value">${soil.seepage_risk}</span></div>`
+    : soil
+    ? `<p class="hint" style="color:#b3413a;">⚠ ${soil.note}</p>`
+    : "";
+
+  const autoNote = autoSelectedInfo
+    ? `<p class="hint" style="color:#2c5a3d;">⭐ Auto-suggested lowest-elevation site (elevation ${autoSelectedInfo.elevation_at_site_m}m, lower than ${autoSelectedInfo.elevation_percentile_among_candidates}% of nearby candidates).</p>`
+    : "";
+
+  resultsContent.innerHTML = `
+    ${autoNote}
+    <div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>
+    <div class="result-row"><span class="label">Avg annual rainfall</span><span class="value">${rec.rainfall.annual_average_mm} mm</span></div>
+    <div class="result-row"><span class="label">Catchment area</span><span class="value">${rec.catchment.area_hectares} ha</span></div>
+    <div class="result-row"><span class="label">Curve number (land cover)</span><span class="value">${rec.runoff.curve_number_used} (${rec.runoff.land_cover_assumed})</span></div>
+    <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>
+    <div class="result-row"><span class="label">Recommended depth</span><span class="value">${p.recommended_depth_m} m</span></div>
+    <div class="result-row"><span class="label">Recommended surface area</span><span class="value">${p.recommended_surface_area_m2.toLocaleString()} m²</span></div>
+    <div class="result-row"><span class="label">Storage capacity</span><span class="value">${p.achievable_storage_capacity_m3.toLocaleString()} m³</span></div>
+    ${soilNote}
+    <p class="hint" style="margin-top:12px;">${sufficiencyNote}</p>
+    ${siteCheckNote}
+    ${catchmentClippedNote}
+  `;
+}
+
+// ---- Auto-suggest the best (lowest-elevation) pond site within the searched village ----
+document.getElementById("suggest-site-btn").addEventListener("click", async () => {
+  if (!lastVillageBbox) return;
+  const btn = document.getElementById("suggest-site-btn");
+  const originalText = btn.textContent;
+  btn.textContent = "Finding best site...";
+  btn.disabled = true;
+
+  resultsPanel.classList.remove("hidden");
+  resultsContent.innerHTML = `<p class="hint">Fetching elevation data and finding the lowest-elevation drainage point... (this can take 20-50s)</p>`;
+
+  try {
+    const { south, north, west, east } = lastVillageBbox;
+    const rec = await suggestPondSite(south, north, west, east);
+    const { lat, lon } = rec.location;
+    if (siteMarker) map.removeLayer(siteMarker);
+    siteMarker = L.marker([lat, lon], {
+      icon: L.divIcon({ className: "site-marker", html: "⭐", iconSize: [24, 24] }),
+    }).addTo(map);
+    map.setView([lat, lon], 14);
+    renderSiteSummary(rec, lat, lon, rec.auto_selected);
+  } catch (err) {
+    resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = false;
   }
 });
 

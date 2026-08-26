@@ -109,6 +109,18 @@ html, body {
   margin-bottom: 8px;
 }
 
+.suggest-btn {
+  background: #f0f7ec;
+  border-color: #2c5a3d;
+  color: #2c5a3d;
+  font-weight: 700;
+}
+
+.suggest-btn:not(:disabled):hover {
+  background: #2c5a3d;
+  color: white;
+}
+
 .layer-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
