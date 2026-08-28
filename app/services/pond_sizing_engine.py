@@ -68,6 +68,32 @@ def recommend_pond(
     """
     target_volume_m3 = required_volume_m3 * target_capture_fraction
 
+    # If there's essentially no eligible land (e.g. strict ownership/land-use
+    # filtering found no usable government-owned vacant patch), don't compute
+    # a degenerate near-zero "pond" -- clearly report that no pond can be
+    # recommended here at all, rather than a nonsensical 3m x 3m puddle.
+    MIN_VIABLE_SITE_AREA_M2 = 20.0
+    if available_site_area_m2 < MIN_VIABLE_SITE_AREA_M2:
+        return {
+            "target_capture_fraction": target_capture_fraction,
+            "target_volume_m3": round(target_volume_m3, 1),
+            "recommended_depth_m": None,
+            "recommended_surface_area_m2": None,
+            "recommended_surface_dimensions_m": None,
+            "achievable_storage_capacity_m3": 0.0,
+            "achievable_storage_capacity_liters": 0.0,
+            "site_area_sufficient_for_target": False,
+            "percent_of_annual_runoff_captured": 0.0,
+            "side_slope_ratio": f"{SIDE_SLOPE_RATIO}:1 (horizontal:vertical)",
+            "cannot_recommend": True,
+            "reason": (
+                f"No pond can be recommended here: only {available_site_area_m2:.1f} m2 of "
+                f"eligible land was found (below the {MIN_VIABLE_SITE_AREA_M2:.0f} m2 practical "
+                f"minimum). Try a different location, or verify whether nearby land is actually "
+                f"government-owned and vacant through official records."
+            ),
+        }
+
     # Cap the pond's surface area at whatever flat land is actually available,
     # leaving a margin for embankments/access (use at most 70% of the site).
     max_usable_area_m2 = available_site_area_m2 * 0.7

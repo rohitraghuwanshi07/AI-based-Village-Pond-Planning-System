@@ -12,13 +12,7 @@ Public endpoint, free, no API key required.
 import httpx
 from shapely.geometry import LineString, Polygon
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-
-HEADERS = {
-    "User-Agent": "village-pond-planner-student-project (contact: student@example.com)",
-    "Accept": "application/json",
-    "Content-Type": "application/x-www-form-urlencoded",
-}
+from app.services.overpass_client import query_overpass
 
 
 async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) -> dict:
@@ -55,10 +49,7 @@ async def fetch_obstructions(lat: float, lon: float, radius_m: float = 150.0) ->
     """
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": query}, headers=HEADERS)
-            resp.raise_for_status()
-            data = resp.json()
+        data = await query_overpass(query)
     except Exception as e:
         return {"buildings": [], "roads": [], "water": [], "query_succeeded": False, "error": str(e)}
 

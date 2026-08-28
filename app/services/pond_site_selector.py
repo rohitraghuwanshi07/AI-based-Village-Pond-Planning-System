@@ -28,6 +28,7 @@ def select_pond_site(
     edge_margin_cells: int = 3,
     elevation_weight: float = 0.6,
     accumulation_weight: float = 0.4,
+    restrict_mask: np.ndarray | None = None,
 ):
     """
     Pick the best candidate pond site cell.
@@ -44,6 +45,12 @@ def select_pond_site(
         edge_margin_cells: exclude cells within this many cells of the raster edge
         elevation_weight: how strongly to favor low elevation (0-1)
         accumulation_weight: how strongly to favor high flow accumulation (0-1)
+        restrict_mask: optional boolean array (same shape as slope_deg) --
+                        if provided, only cells where this is True are ever
+                        considered, regardless of slope. Used to restrict site
+                        selection to a specific eligible land patch (e.g. from
+                        an uploaded land-ownership record), rather than the
+                        whole raster.
 
     Returns:
         (row, col, info_dict) for the selected site. info_dict explains why
@@ -56,6 +63,8 @@ def select_pond_site(
 
     interior_mask = np.zeros_like(slope_deg, dtype=bool)
     interior_mask[edge_margin_cells: rows - edge_margin_cells, edge_margin_cells: cols - edge_margin_cells] = True
+    if restrict_mask is not None:
+        interior_mask = interior_mask & restrict_mask
 
     low_slope_mask = slope_deg <= max_slope_deg
     candidate_mask = interior_mask & low_slope_mask & ~np.isnan(slope_deg)
@@ -65,6 +74,16 @@ def select_pond_site(
         candidate_mask = interior_mask
         tier = "relaxed_ignoring_slope"
     if not candidate_mask.any():
+        if restrict_mask is not None:
+            # A restrict_mask means "only ever consider this specific eligible
+            # patch" -- if it's genuinely empty, there is no valid site, and
+            # falling back to the whole raster would silently pick a location
+            # OUTSIDE the eligible land, defeating the entire point of the
+            # restriction. Fail loudly instead.
+            raise ValueError(
+                "No valid cell found within restrict_mask -- the eligible "
+                "patch may be empty or too small/fragmented to site a pond."
+            )
         candidate_mask = np.ones_like(slope_deg, dtype=bool)
         tier = "whole_raster_fallback"
 

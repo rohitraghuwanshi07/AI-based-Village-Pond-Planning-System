@@ -27,6 +27,10 @@ let contourLayer = null;
 let catchmentLayer = null;
 let pondFootprintLayer = null;
 let vacantLandLayer = null;
+let ownershipGovLayer = null;
+let ownershipPrivateLayer = null;
+let ownershipUnverifiedLayer = null;
+let ownershipEligibleLayer = null;
 let lastVillageBbox = null;
 
 // ---- Layer toggle buttons ----
@@ -143,27 +147,60 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
 
   const p = rec.pond_recommendation;
 
-  // Draw the REAL usable vacant land boundary (buildings/roads/water already
-  // excluded, and separate patches split by a road are shown as separate
-  // shapes, not merged) -- this is the actual buildable area, distinct from
-  // both the huge catchment polygon and the small proposed pond square.
+  // Draw ALL ownership/exclusion layers, per the strict eligibility pipeline:
+  // government-owned (green), private (red hatch, excluded), unverified
+  // (gray, excluded by default), and the final eligible patch (gold).
+  [ownershipGovLayer, ownershipPrivateLayer, ownershipUnverifiedLayer, ownershipEligibleLayer].forEach(l => {
+    if (l) map.removeLayer(l);
+  });
+  ownershipGovLayer = ownershipPrivateLayer = ownershipUnverifiedLayer = ownershipEligibleLayer = null;
+
+  const ol = rec.ownership_layers;
+  if (ol) {
+    if (ol.unverified_ownership) {
+      ownershipUnverifiedLayer = L.geoJSON(ol.unverified_ownership, {
+        style: { color: "#888888", weight: 1, fillColor: "#cccccc", fillOpacity: 0.25, dashArray: "3,3" },
+      }).addTo(map).bindPopup("Ownership unverified — excluded by default");
+    }
+    if (ol.private) {
+      ownershipPrivateLayer = L.geoJSON(ol.private, {
+        style: { color: "#b3413a", weight: 1, fillColor: "#e08c85", fillOpacity: 0.3 },
+      }).addTo(map).bindPopup("Private land — excluded");
+    }
+    if (ol.government_owned) {
+      ownershipGovLayer = L.geoJSON(ol.government_owned, {
+        style: { color: "#2c5a3d", weight: 1.5, fillColor: "#a8d5b0", fillOpacity: 0.25 },
+      }).addTo(map).bindPopup("Government/public land (OSM-tag heuristic, not verified cadastral record)");
+    }
+    if (ol.final_eligible) {
+      ownershipEligibleLayer = L.geoJSON(ol.final_eligible, {
+        style: { color: "#c9962c", weight: 2.5, fillColor: "#f0d264", fillOpacity: 0.45 },
+      }).addTo(map).bindPopup("Final eligible land: government-owned, vacant, unoccupied");
+    }
+  }
+
+  // Also draw the specific selected patch boundary (subset of the eligible layer)
   if (vacantLandLayer) map.removeLayer(vacantLandLayer);
   if (rec.vacant_land_boundary_geojson) {
     vacantLandLayer = L.geoJSON(rec.vacant_land_boundary_geojson, {
       style: { color: "#8a5a2b", weight: 2, fillColor: "#e8d5a8", fillOpacity: 0.35, dashArray: "6,4" },
-    }).addTo(map).bindPopup("Usable vacant land (buildings/roads/water excluded)");
+    }).addTo(map).bindPopup("Selected eligible patch (closest to this site)");
   }
 
   if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
-  const sideMeters = Math.sqrt(p.recommended_surface_area_m2);
-  const halfSideDegLat = (sideMeters / 2) / 111320;
-  const halfSideDegLon = (sideMeters / 2) / (111320 * Math.cos(lat * Math.PI / 180));
-  pondFootprintLayer = L.rectangle(
-    [[lat - halfSideDegLat, lng - halfSideDegLon], [lat + halfSideDegLat, lng + halfSideDegLon]],
-    { color: "#d9534f", weight: 2, fillColor: "#d9534f", fillOpacity: 0.4 }
-  ).addTo(map).bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
+  if (p.recommended_surface_area_m2) {
+    const sideMeters = Math.sqrt(p.recommended_surface_area_m2);
+    const halfSideDegLat = (sideMeters / 2) / 111320;
+    const halfSideDegLon = (sideMeters / 2) / (111320 * Math.cos(lat * Math.PI / 180));
+    pondFootprintLayer = L.rectangle(
+      [[lat - halfSideDegLat, lng - halfSideDegLon], [lat + halfSideDegLat, lng + halfSideDegLon]],
+      { color: "#d9534f", weight: 2, fillColor: "#d9534f", fillOpacity: 0.4 }
+    ).addTo(map).bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
+  }
 
-  const sufficiencyNote = p.site_area_sufficient_for_target
+  const sufficiencyNote = p.cannot_recommend
+    ? `<span style="color:#b3413a;">✗ ${p.reason}</span>`
+    : p.site_area_sufficient_for_target
     ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction*100).toFixed(0)}% capture target</span>`
     : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
 
@@ -172,11 +209,20 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     : "";
 
   const sc = rec.site_check;
-  const siteCheckNote = sc && sc.total_separate_patches_found !== undefined
-    ? `<p class="hint">Found ${sc.total_separate_patches_found} separate open patch(es) nearby (${sc.buildings_found_nearby} building(s), ${sc.roads_found_nearby} road(s), ${sc.water_bodies_found_nearby || 0} water body/ies excluded). Using the ${sc.available_area_m2.toLocaleString()} m² patch closest to this site.</p>`
-    : sc && sc.note
-    ? `<p class="hint" style="color:#b3413a;">⚠ ${sc.note}</p>`
-    : "";
+  let siteCheckNote = "";
+  if (sc && sc.area_breakdown) {
+    const b = sc.area_breakdown;
+    siteCheckNote = `
+      <div class="result-row"><span class="label">Government-owned land nearby</span><span class="value">${b.government_owned_area_m2.toLocaleString()} m²</span></div>
+      <div class="result-row"><span class="label">— occupied by development</span><span class="value">-${b.government_area_occupied_by_development_m2.toLocaleString()} m²</span></div>
+      <div class="result-row"><span class="label">Private land (excluded)</span><span class="value">${b.private_area_m2.toLocaleString()} m²</span></div>
+      <div class="result-row"><span class="label">Ownership unverified (excluded)</span><span class="value">${b.unverified_ownership_area_m2.toLocaleString()} m²</span></div>
+      <div class="result-row"><span class="label"><strong>Final eligible area</strong></span><span class="value"><strong>${b.final_eligible_vacant_government_area_m2.toLocaleString()} m²</strong></span></div>
+      <p class="hint" style="margin-top:6px;">${sc.limitation}</p>
+    `;
+  } else if (sc && sc.note) {
+    siteCheckNote = `<p class="hint" style="color:#b3413a;">⚠ ${sc.note}</p>`;
+  }
 
   const soil = rec.soil_check;
   const soilNote = soil && soil.query_succeeded
@@ -190,6 +236,10 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ? `<p class="hint" style="color:#2c5a3d;">⭐ Auto-suggested lowest-elevation site (elevation ${autoSelectedInfo.elevation_at_site_m}m, lower than ${autoSelectedInfo.elevation_percentile_among_candidates}% of nearby candidates).</p>`
     : "";
 
+  const depthDisplay = p.recommended_depth_m !== null ? `${p.recommended_depth_m} m` : "—";
+  const areaDisplay = p.recommended_surface_area_m2 !== null ? `${p.recommended_surface_area_m2.toLocaleString()} m²` : "—";
+  const capacityDisplay = p.achievable_storage_capacity_m3 !== null ? `${p.achievable_storage_capacity_m3.toLocaleString()} m³` : "—";
+
   resultsContent.innerHTML = `
     ${autoNote}
     <div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>
@@ -197,11 +247,12 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     <div class="result-row"><span class="label">Catchment area</span><span class="value">${rec.catchment.area_hectares} ha</span></div>
     <div class="result-row"><span class="label">Curve number (land cover)</span><span class="value">${rec.runoff.curve_number_used} (${rec.runoff.land_cover_assumed})</span></div>
     <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>
-    <div class="result-row"><span class="label">Recommended depth</span><span class="value">${p.recommended_depth_m} m</span></div>
-    <div class="result-row"><span class="label">Recommended surface area</span><span class="value">${p.recommended_surface_area_m2.toLocaleString()} m²</span></div>
-    <div class="result-row"><span class="label">Storage capacity</span><span class="value">${p.achievable_storage_capacity_m3.toLocaleString()} m³</span></div>
+    <div class="result-row"><span class="label">Recommended depth</span><span class="value">${depthDisplay}</span></div>
+    <div class="result-row"><span class="label">Recommended surface area</span><span class="value">${areaDisplay}</span></div>
+    <div class="result-row"><span class="label">Storage capacity</span><span class="value">${capacityDisplay}</span></div>
     ${soilNote}
     <p class="hint" style="margin-top:12px;">${sufficiencyNote}</p>
+    <h3 style="margin:14px 0 6px 0; font-size:0.9rem;">Land eligibility (ownership + land-use)</h3>
     ${siteCheckNote}
     ${catchmentClippedNote}
   `;

@@ -33,7 +33,8 @@ from app.services.pond_site_selector import select_pond_site
 from app.services.rainfall_client import get_historical_rainfall
 from app.services.runoff_engine import estimate_daily_series_runoff, DEFAULT_CURVE_NUMBER, CURVE_NUMBERS
 from app.services.land_use_client import fetch_obstructions
-from app.services.site_suitability import find_vacant_patches
+from app.services.ownership_client import fetch_ownership_zones
+from app.services.site_suitability import find_eligible_patches
 from app.services.pond_sizing_engine import recommend_pond
 from app.services.soil_client import fetch_soil_composition
 
@@ -118,54 +119,62 @@ async def _analyze_contour_impl(
     cell_area_m2 = px_m * py_m
     catchment_area_m2 = float(catchment_mask.sum()) * cell_area_m2
 
-    # --- Real pond sizing, grounded in actual land availability (not a guess) ---
-    # This checks real OpenStreetMap building/road/water data near the selected
-    # site and finds genuinely CONTIGUOUS vacant land -- patches split apart by
-    # a road are treated as separate, not combined into one leftover number.
+    # --- Real pond sizing, grounded in actual land availability AND ownership ---
+    # This checks real OpenStreetMap building/road/water data AND a heuristic
+    # government-ownership classification (see ownership_client.py for the
+    # important limitation notice: there is no free authoritative cadastral
+    # API). Only land explicitly tagged government/public, not occupied by
+    # development, and not tagged private counts as eligible. Untagged land
+    # is ownership-unverified and excluded by default -- this commonly means
+    # the eligible area will be small or zero near real locations.
     t = time.time()
     site_check = None
     vacant_land_boundary_geojson = None
+    ownership_layers = None
     obstruction_data = await fetch_obstructions(site_lat, site_lon, radius_m=150.0)
-    if obstruction_data["query_succeeded"]:
-        patch_result = find_vacant_patches(
+    ownership_data = await fetch_ownership_zones(site_lat, site_lon, radius_m=150.0)
+
+    if obstruction_data["query_succeeded"] and ownership_data["query_succeeded"]:
+        patch_result = find_eligible_patches(
             site_lat, site_lon,
             buildings=obstruction_data["buildings"],
             roads=obstruction_data["roads"],
             water=obstruction_data["water"],
+            government_zones=ownership_data["government_zones"],
+            private_zones=ownership_data["private_zones"],
             search_radius_m=150.0,
         )
+        ownership_layers = patch_result["layer_boundaries"]
         if patch_result["patches"] and patch_result["selected_patch_index"] is not None:
             selected_patch = patch_result["patches"][patch_result["selected_patch_index"]]
             available_area_m2 = selected_patch["area_m2"]
             vacant_land_boundary_geojson = selected_patch["boundary_geojson"]
-            site_check = {
-                "available_area_m2": available_area_m2,
-                "buildings_found_nearby": patch_result["buildings_found_nearby"],
-                "roads_found_nearby": patch_result["roads_found_nearby"],
-                "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
-                "total_separate_patches_found": len(patch_result["patches"]),
-                "note": (
-                    f"Selected the contiguous vacant patch actually containing/nearest to the "
-                    f"selected site ({available_area_m2} m2), out of {len(patch_result['patches'])} "
-                    f"separate open patch(es) found nearby."
-                ),
-            }
         else:
             available_area_m2 = 0.0
-            site_check = {
-                "available_area_m2": 0.0,
-                "note": "No usable vacant land patch found within 150m of the selected site.",
-            }
-    else:
-        search_radius_m = 150.0
-        assumed_open_fraction = 0.6
-        available_area_m2 = round(3.14159 * (search_radius_m ** 2) * assumed_open_fraction, 1)
         site_check = {
             "available_area_m2": available_area_m2,
-            "note": f"OpenStreetMap obstruction check failed ({obstruction_data['error']}); "
-                    f"assuming {int(assumed_open_fraction*100)}% of the {search_radius_m:.0f}m search "
-                    f"radius is open land (unverified). Confirm this site is actually clear of "
-                    f"buildings/roads/water before construction.",
+            "area_breakdown": patch_result["area_breakdown"],
+            "total_separate_eligible_patches_found": len(patch_result["patches"]),
+            "government_zones_found_nearby": patch_result["government_zones_found_nearby"],
+            "private_zones_found_nearby": patch_result["private_zones_found_nearby"],
+            "buildings_found_nearby": patch_result["buildings_found_nearby"],
+            "roads_found_nearby": patch_result["roads_found_nearby"],
+            "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
+            "limitation": patch_result["ownership_data_limitation"],
+        }
+    else:
+        failed_reasons = []
+        if not obstruction_data["query_succeeded"]:
+            failed_reasons.append(f"obstruction check failed ({obstruction_data['error']})")
+        if not ownership_data["query_succeeded"]:
+            failed_reasons.append(f"ownership check failed ({ownership_data['error']})")
+        available_area_m2 = 0.0
+        site_check = {
+            "available_area_m2": 0.0,
+            "note": (
+                f"Could not verify land ownership/availability ({'; '.join(failed_reasons)}). "
+                f"0 m2 eligible area is reported rather than guessed -- verify manually."
+            ),
         }
     timings["land_use_check_seconds"] = round(time.time() - t, 2)
 
@@ -236,6 +245,7 @@ async def _analyze_contour_impl(
         },
         "site_check": site_check,
         "vacant_land_boundary_geojson": vacant_land_boundary_geojson,
+        "ownership_layers": ownership_layers,
         "soil_check": soil_check,
         "pond_sizing_recommendation": pond_sizing,
         "methodology": (
