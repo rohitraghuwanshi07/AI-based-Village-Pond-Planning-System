@@ -18,13 +18,51 @@ Search a village → click a candidate site on the map → get a complete site a
 
 ## ✨ Features
 
+- 🔍 Village AND landmark search (Photon geocoder — resolves specific institutions
+  like "IIT Bhilai", not just cities, with Open-Meteo as fallback)
 - 🛰️ Satellite imagery + street map toggle
-- 🗺️ Contour line visualization from real SRTM elevation data
+- 🗺️ Color-coded contour visualization (blue=low → red=high elevation) from real SRTM data
 - 💧 Catchment (watershed) delineation for any clicked point
+- ⭐ **Automatic pond site suggestion** — finds the lowest-elevation, best-draining
+  point in a searched area with no manual click required (water physically collects
+  at the lowest point of a basin; this is weighted as the primary factor)
 - 🌧️ Historical rainfall lookup (10+ years, no API key required)
 - 📊 Runoff volume estimation using the SCS Curve Number method
-- 🏞️ Pond depth/area/storage capacity recommendation using earthwork volume formulas
+- 🏗️ **Land eligibility analysis**: rasterizes real OpenStreetMap buildings, roads,
+  and water bodies to find genuinely CONTIGUOUS vacant patches — a patch split by
+  a road is correctly treated as two separate patches, not combined into one number
+- 🏛️ **Ownership-aware filtering (strict mode)**: only land explicitly OSM-tagged as
+  government/public is eligible; private and ownership-unverified land is excluded
+  by default (see "Ownership Data Limitation" below — this is a heuristic, not a
+  legal verification, and the app says so explicitly in every response)
+- 🏜️ Soil composition check (ISRIC SoilGrids) — sand/silt/clay % and seepage-risk rating
+- 🏞️ Pond depth/area/storage capacity recommendation using earthwork volume formulas,
+  preferring realistic depths (~2.5m) over degenerate shallow-and-huge solutions,
+  and clearly reports "cannot recommend a pond here" instead of a nonsensical
+  micro-pond when no eligible land exists
+- 📄 Upload your own KML/KMZ contour map for fully independent terrain analysis (Phase 2)
 - 🌍 Works anywhere SRTM elevation data exists (India-wide and beyond)
+
+---
+
+## ⚖️ Ownership Data Limitation (read this before relying on results)
+
+**There is no free, authoritative, publicly-queryable cadastral/land-ownership API**
+for India (or most countries) that can be looked up by coordinates. Real land
+ownership records live in state-specific government portals (e.g. Bhulekh,
+Bhu-Naksha) that require manual survey-number lookups, not spatial API access.
+
+This app's "government-owned land" classification is a **heuristic** based on
+OpenStreetMap tags (government offices, protected areas, village common/panchayat
+land, military land, etc.) — **not legal proof of ownership**. Untagged land
+(the vast majority of most areas in OSM) is treated as **ownership-unverified**
+and **excluded by default** from any proposed pond area, per a strict "don't
+include what you can't verify" policy. This commonly means the reported eligible
+area will be small or zero, especially in rural areas with sparse OSM tagging —
+**this is intentional, honest behavior, not a bug.**
+
+**Before any real construction, ownership must be confirmed through actual
+government land records for that state/district.**
 
 ---
 
@@ -143,7 +181,8 @@ http://127.0.0.1:5500/frontend/
 | `/api/rainfall?lat=&lon=&years=` | GET | Historical rainfall statistics |
 | `/api/terrain/analyze?south=&north=&west=&east=` | GET | Slope + contour lines for an area |
 | `/api/catchment/delineate?...&pour_lat=&pour_lon=` | GET | Watershed boundary for a clicked point |
-| `/api/pond/recommend?...` | GET | Full pipeline: catchment → rainfall → runoff → pond sizing |
+| `/api/pond/recommend?...` | GET | Full pipeline for a manually-chosen point: catchment → rainfall → runoff → land-use → soil → pond sizing |
+| `/api/pond/suggest-site?south=&north=&west=&east=` | GET | Same pipeline, but auto-selects the lowest-elevation site within the given area — no manual point needed |
 | `/api/analyzeContour` (alias `/api/findCatchment`) | POST | Upload a KML/KMZ contour map, get an auto-identified pond site + catchment area |
 
 Full interactive documentation is auto-generated at `/docs` (Swagger UI) when the backend is running.

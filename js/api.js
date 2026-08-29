@@ -74,3 +74,20 @@ async function suggestPondSite(south, north, west, east, options = {}) {
   }
   return resp.json();
 }
+
+async function suggestFromLandRecord(file, options = {}) {
+  const params = new URLSearchParams({
+    land_cover: options.landCover || "cultivated_land",
+    target_capture_fraction: options.targetFraction || 0.5,
+  });
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const url = `${API_BASE}/api/pond/suggest-from-landrecord?${params.toString()}`;
+  const resp = await fetch(url, { method: "POST", body: formData });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.detail || `Land record analysis failed (${resp.status})`);
+  }
+  return resp.json();
+}

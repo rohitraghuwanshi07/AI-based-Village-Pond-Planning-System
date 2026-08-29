@@ -141,11 +141,13 @@ async function analyzeAndRender(lat, lng, isAutoSuggested, autoSelectedInfo = nu
 
 function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
   if (catchmentLayer) map.removeLayer(catchmentLayer);
-  catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
-    style: { color: "#2c5a3d", weight: 2, fillColor: "#4a90d9", fillOpacity: 0.25 },
-  }).addTo(map);
+  if (rec.catchment && rec.catchment.boundary_geojson) {
+    catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
+      style: { color: "#2c5a3d", weight: 2, fillColor: "#4a90d9", fillOpacity: 0.25 },
+    }).addTo(map);
+  }
 
-  const p = rec.pond_recommendation;
+  const p = rec.pond_recommendation || {};
 
   // Draw ALL ownership/exclusion layers, per the strict eligibility pipeline:
   // government-owned (green), private (red hatch, excluded), unverified
@@ -156,6 +158,10 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
   ownershipGovLayer = ownershipPrivateLayer = ownershipUnverifiedLayer = ownershipEligibleLayer = null;
 
   const ol = rec.ownership_layers;
+  const isFromLandRecord = rec.site_check && rec.site_check.source === "user-uploaded land record (not OSM heuristic)";
+  const govPopupText = isFromLandRecord
+    ? "Government-owned land (from your uploaded land record)"
+    : "Government/public land (OSM-tag heuristic, not verified cadastral record)";
   if (ol) {
     if (ol.unverified_ownership) {
       ownershipUnverifiedLayer = L.geoJSON(ol.unverified_ownership, {
@@ -170,7 +176,7 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     if (ol.government_owned) {
       ownershipGovLayer = L.geoJSON(ol.government_owned, {
         style: { color: "#2c5a3d", weight: 1.5, fillColor: "#a8d5b0", fillOpacity: 0.25 },
-      }).addTo(map).bindPopup("Government/public land (OSM-tag heuristic, not verified cadastral record)");
+      }).addTo(map).bindPopup(govPopupText);
     }
     if (ol.final_eligible) {
       ownershipEligibleLayer = L.geoJSON(ol.final_eligible, {
@@ -204,7 +210,7 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction*100).toFixed(0)}% capture target</span>`
     : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
 
-  const catchmentClippedNote = rec.catchment.area_hectares > (2 * ANALYSIS_HALF_SIZE_DEG * 111) * (2 * ANALYSIS_HALF_SIZE_DEG * 111) * 0.9
+  const catchmentClippedNote = rec.catchment && rec.catchment.area_hectares > (2 * ANALYSIS_HALF_SIZE_DEG * 111) * (2 * ANALYSIS_HALF_SIZE_DEG * 111) * 0.9
     ? `<p class="hint" style="color:#b3841a;">Note: this catchment may extend beyond our ${(ANALYSIS_HALF_SIZE_DEG*2*111).toFixed(0)}km analysis window and could be larger than shown.</p>`
     : "";
 
@@ -236,17 +242,27 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ? `<p class="hint" style="color:#2c5a3d;">⭐ Auto-suggested lowest-elevation site (elevation ${autoSelectedInfo.elevation_at_site_m}m, lower than ${autoSelectedInfo.elevation_percentile_among_candidates}% of nearby candidates).</p>`
     : "";
 
-  const depthDisplay = p.recommended_depth_m !== null ? `${p.recommended_depth_m} m` : "—";
-  const areaDisplay = p.recommended_surface_area_m2 !== null ? `${p.recommended_surface_area_m2.toLocaleString()} m²` : "—";
-  const capacityDisplay = p.achievable_storage_capacity_m3 !== null ? `${p.achievable_storage_capacity_m3.toLocaleString()} m³` : "—";
+  const depthDisplay = p.recommended_depth_m !== null && p.recommended_depth_m !== undefined ? `${p.recommended_depth_m} m` : "—";
+  const areaDisplay = p.recommended_surface_area_m2 !== null && p.recommended_surface_area_m2 !== undefined ? `${p.recommended_surface_area_m2.toLocaleString()} m²` : "—";
+  const capacityDisplay = p.achievable_storage_capacity_m3 !== null && p.achievable_storage_capacity_m3 !== undefined ? `${p.achievable_storage_capacity_m3.toLocaleString()} m³` : "—";
+
+  const rainfallRow = rec.rainfall
+    ? `<div class="result-row"><span class="label">Avg annual rainfall</span><span class="value">${rec.rainfall.annual_average_mm} mm</span></div>`
+    : "";
+  const catchmentRow = rec.catchment
+    ? `<div class="result-row"><span class="label">Catchment area</span><span class="value">${rec.catchment.area_hectares} ha</span></div>`
+    : "";
+  const runoffRows = rec.runoff
+    ? `<div class="result-row"><span class="label">Curve number (land cover)</span><span class="value">${rec.runoff.curve_number_used} (${rec.runoff.land_cover_assumed})</span></div>
+       <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>`
+    : "";
 
   resultsContent.innerHTML = `
     ${autoNote}
-    <div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>
-    <div class="result-row"><span class="label">Avg annual rainfall</span><span class="value">${rec.rainfall.annual_average_mm} mm</span></div>
-    <div class="result-row"><span class="label">Catchment area</span><span class="value">${rec.catchment.area_hectares} ha</span></div>
-    <div class="result-row"><span class="label">Curve number (land cover)</span><span class="value">${rec.runoff.curve_number_used} (${rec.runoff.land_cover_assumed})</span></div>
-    <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>
+    ${lat !== null ? `<div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>` : ""}
+    ${rainfallRow}
+    ${catchmentRow}
+    ${runoffRows}
     <div class="result-row"><span class="label">Recommended depth</span><span class="value">${depthDisplay}</span></div>
     <div class="result-row"><span class="label">Recommended surface area</span><span class="value">${areaDisplay}</span></div>
     <div class="result-row"><span class="label">Storage capacity</span><span class="value">${capacityDisplay}</span></div>
@@ -279,6 +295,65 @@ document.getElementById("suggest-site-btn").addEventListener("click", async () =
     }).addTo(map);
     map.setView([lat, lon], 14);
     renderSiteSummary(rec, lat, lon, rec.auto_selected);
+  } catch (err) {
+    resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = false;
+  }
+});
+
+// ---- Enable the land record button once a file is chosen ----
+document.getElementById("landrecord-file").addEventListener("change", (e) => {
+  document.getElementById("landrecord-btn").disabled = !e.target.files.length;
+});
+
+// ---- Find best pond site from an uploaded land record (real ownership data,
+// no dependency on OSM/Overpass at all) ----
+document.getElementById("landrecord-btn").addEventListener("click", async () => {
+  const fileInput = document.getElementById("landrecord-file");
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  const btn = document.getElementById("landrecord-btn");
+  const originalText = btn.textContent;
+  btn.textContent = "Analyzing land record...";
+  btn.disabled = true;
+
+  resultsPanel.classList.remove("hidden");
+  resultsContent.innerHTML = `<p class="hint">Parsing land record, classifying parcels, and finding the best eligible site... (this can take 20-60s)</p>`;
+
+  try {
+    const rec = await suggestFromLandRecord(file);
+
+    if (rec.pond_recommendation && rec.pond_recommendation.cannot_recommend && !rec.location) {
+      // No eligible government land found anywhere in the record at all --
+      // still show the ownership layers (so the user sees WHY), but there's
+      // no site/catchment/pond to render.
+      renderSiteSummary(rec, null, null, null);
+      const counts = rec.land_record_summary.classification_counts;
+      const countsText = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(", ");
+      resultsContent.innerHTML =
+        `<p class="status-text error">✗ ${rec.pond_recommendation.reason}</p>` +
+        `<p class="hint">Parcels found: ${countsText}</p>`;
+      return;
+    }
+
+    const { lat, lon } = rec.location;
+    if (siteMarker) map.removeLayer(siteMarker);
+    siteMarker = L.marker([lat, lon], {
+      icon: L.divIcon({ className: "site-marker", html: "📄", iconSize: [24, 24] }),
+    }).addTo(map);
+    map.setView([lat, lon], 15);
+    renderSiteSummary(rec, lat, lon, rec.auto_selected);
+
+    // Prepend a note about the land record source, since this result is
+    // grounded in real uploaded data rather than an OSM heuristic.
+    const counts = rec.land_record_summary.classification_counts;
+    const countsText = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(", ");
+    resultsContent.innerHTML =
+      `<p class="hint" style="color:#2c5a3d;">📄 From uploaded land record "${rec.land_record_summary.filename}" (${rec.land_record_summary.parcels_parsed} parcels: ${countsText})</p>` +
+      resultsContent.innerHTML;
   } catch (err) {
     resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
   } finally {

@@ -51,6 +51,13 @@
         <p class="hint">Click anywhere on the map to select a candidate pond site.</p>
       </div>
 
+      <div class="panel landrecord-panel">
+        <label for="landrecord-file">Upload land record (GeoJSON/KML)</label>
+        <p class="hint">Use an actual Bhu-Naksha-style parcel document instead of the OSM ownership guess — stronger, more defensible eligibility check.</p>
+        <input type="file" id="landrecord-file" accept=".geojson,.json,.kml" />
+        <button id="landrecord-btn" class="layer-btn full-width suggest-btn" style="margin-top:8px;" disabled>📄 Find Site From Land Record</button>
+      </div>
+
       <div id="results-panel" class="panel results hidden">
         <h2>Site Summary</h2>
         <div id="results-content"></div>

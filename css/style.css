@@ -187,3 +187,10 @@ html, body {
   flex: 1;
   height: 100%;
 }
+
+.landrecord-panel input[type="file"] {
+  width: 100%;
+  font-size: 0.8rem;
+  padding: 6px 0;
+  color: #4a5a4f;
+}

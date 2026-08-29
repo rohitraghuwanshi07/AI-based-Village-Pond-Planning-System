@@ -22,7 +22,13 @@ OVERPASS_MIRRORS = [
 
 HEADERS = {
     "User-Agent": "village-pond-planner-student-project (contact: student@example.com)",
-    "Accept": "application/json",
+    # Deliberately NOT setting an explicit Accept header. A literal
+    # "406 Not Acceptable" response means the server can't produce a
+    # representation matching our Accept value -- Overpass's JSON output is
+    # controlled by [out:json] inside the query itself, not content
+    # negotiation, so asserting "Accept: application/json" can cause exactly
+    # this failure on servers that don't special-case it. Omitting it lets
+    # httpx send the default "*/*", which every server accepts.
 }
 
 
