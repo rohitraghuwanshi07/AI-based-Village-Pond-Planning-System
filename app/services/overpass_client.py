@@ -1,8 +1,19 @@
 """
 Shared helper for querying Overpass API, with fallback across multiple free
-public mirror servers. We've now seen two separate real-world cases in this
-project where a specific free geodata host rejected requests for a particular
-network/environment (Nominatim earlier, and overpass-api.de intermittently) --
+public mirror servers, AND a local disk cache.
+
+Why the cache matters: public Overpass instances enforce strict per-IP rate
+limits (often just ~2 concurrent requests). Repeated testing during
+development -- clicking the same or nearby locations many times in a short
+period -- can trip these limits, which shows up as inconsistent failures
+(connection resets, 500s, 403s, 406s) that vary between attempts and between
+mirrors. Caching successful responses means we only hit the live API once
+per distinct query, which both avoids re-triggering rate limits and makes
+repeat testing/demos much faster.
+
+We've now seen two separate real-world cases in this project where a
+specific free geodata host rejected requests for a particular network/
+environment (Nominatim earlier, and overpass-api.de intermittently) --
 rather than assume one single endpoint will always be reachable, we try a
 short list of known public Overpass mirrors in order and use the first one
 that responds successfully.
@@ -10,6 +21,11 @@ that responds successfully.
 All of these are free, community-run public Overpass instances -- no API key
 for any of them.
 """
+
+import hashlib
+import json
+import time
+from pathlib import Path
 
 import httpx
 
@@ -31,34 +47,73 @@ HEADERS = {
     # httpx send the default "*/*", which every server accepts.
 }
 
+CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "overpass_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_TTL_SECONDS = 3600  # 1 hour -- long enough to cover repeat testing of the same area
 
-async def query_overpass(query: str, timeout: float = 30.0) -> dict:
+
+def _cache_path_for(query: str) -> Path:
+    key = hashlib.md5(query.encode()).hexdigest()
+    return CACHE_DIR / f"{key}.json"
+
+
+def _read_cache(query: str) -> dict | None:
+    path = _cache_path_for(query)
+    if not path.exists():
+        return None
+    try:
+        age = time.time() - path.stat().st_mtime
+        if age > CACHE_TTL_SECONDS:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_cache(query: str, data: dict) -> None:
+    path = _cache_path_for(query)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # caching is a best-effort optimization, never fail the request over it
+
+
+async def query_overpass(query: str, timeout: float = 30.0, retries_per_mirror: int = 2) -> dict:
     """
-    POST an Overpass QL query, trying each mirror in order until one succeeds.
+    POST an Overpass QL query, trying each mirror in order until one succeeds,
+    with a short retry per mirror and a local disk cache to avoid repeat
+    live calls for the same query within CACHE_TTL_SECONDS.
 
     Returns the parsed JSON response dict.
     Raises the last encountered exception if every mirror fails, with a
     message listing which mirrors were tried -- so a caller/log clearly shows
     this wasn't a single-endpoint fluke.
     """
+    cached = _read_cache(query)
+    if cached is not None:
+        return cached
+
     last_error = None
     errors_by_mirror = []
 
     for url in OVERPASS_MIRRORS:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                # Let httpx set its own Content-Type for form data -- some
-                # mirrors are stricter about header formatting than others,
-                # and this is the most compatible/standard approach.
-                resp = await client.post(url, data={"data": query}, headers=HEADERS)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            errors_by_mirror.append(f"{url}: {e}")
-            last_error = e
-            continue
+        for attempt in range(retries_per_mirror):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, data={"data": query}, headers=HEADERS)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    _write_cache(query, data)
+                    return data
+            except Exception as e:
+                last_error = e
+                if attempt < retries_per_mirror - 1:
+                    continue  # brief retry against the SAME mirror once before moving on
+                errors_by_mirror.append(f"{url}: {e}")
 
     raise RuntimeError(
-        f"All Overpass mirrors failed. Tried {len(OVERPASS_MIRRORS)} servers: "
-        f"{'; '.join(errors_by_mirror)}"
+        f"All Overpass mirrors failed. Tried {len(OVERPASS_MIRRORS)} servers "
+        f"({retries_per_mirror} attempts each): {'; '.join(errors_by_mirror)}"
     ) from last_error

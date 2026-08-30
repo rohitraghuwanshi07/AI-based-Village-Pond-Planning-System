@@ -32,7 +32,7 @@ from app.services.runoff_engine import estimate_daily_series_runoff, DEFAULT_CUR
 from app.services.pond_sizing_engine import recommend_pond
 from app.services.land_use_client import fetch_obstructions
 from app.services.ownership_client import fetch_ownership_zones
-from app.services.site_suitability import find_eligible_patches, find_eligible_patches_from_parcels
+from app.services.site_suitability import find_eligible_patches, find_eligible_patches_from_parcels, find_vacant_patches
 from app.services.soil_client import fetch_soil_composition
 from app.services.elevation_client import fetch_dem
 from app.services.terrain_engine import load_dem, compute_slope_degrees
@@ -141,6 +141,71 @@ async def _full_recommendation(
                     f"Per a strict policy, unverifiable land is not assumed available -- "
                     f"0 m2 eligible area is reported rather than a guess. Retry, or verify "
                     f"this site manually through official government land records."
+                ),
+            }
+    else:
+        # A manual area was provided -- ownership is intentionally NOT checked
+        # (that requires the live check, enabled by leaving the area field
+        # blank). But we still make a best-effort attempt to check for real
+        # buildings/roads/water bodies nearby and CAP the manual number if
+        # they'd eat into it significantly, rather than blindly trusting a
+        # number that might sit right on top of a real structure. If this
+        # lighter check also fails (same underlying network issue as the
+        # full ownership check), we fall back to trusting the manual number
+        # as-is, clearly flagged as unverified.
+        try:
+            obstruction_data = await fetch_obstructions(pour_lat, pour_lon, radius_m=150.0)
+        except Exception as e:
+            obstruction_data = {"query_succeeded": False, "error": str(e)}
+
+        if obstruction_data["query_succeeded"]:
+            patch_result = find_vacant_patches(
+                pour_lat, pour_lon,
+                buildings=obstruction_data["buildings"],
+                roads=obstruction_data["roads"],
+                water=obstruction_data["water"],
+                search_radius_m=150.0,
+            )
+            if patch_result["patches"] and patch_result["selected_patch_index"] is not None:
+                selected_patch = patch_result["patches"][patch_result["selected_patch_index"]]
+                real_vacant_area = selected_patch["area_m2"]
+                manually_entered = available_site_area_m2
+                available_site_area_m2 = min(available_site_area_m2, real_vacant_area)
+                site_check = {
+                    "available_area_m2": available_site_area_m2,
+                    "manually_entered_area_m2": manually_entered,
+                    "real_vacant_patch_area_m2": real_vacant_area,
+                    "buildings_found_nearby": patch_result["buildings_found_nearby"],
+                    "roads_found_nearby": patch_result["roads_found_nearby"],
+                    "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
+                    "note": (
+                        f"Your manually entered area ({manually_entered:.0f} m2) was checked against "
+                        f"real nearby buildings/roads/water bodies and capped to "
+                        f"{available_site_area_m2:.0f} m2 (ownership was NOT checked -- clear the "
+                        f"manual area field to enable the full ownership check)."
+                    ),
+                }
+            else:
+                manually_entered = available_site_area_m2
+                available_site_area_m2 = 0.0
+                site_check = {
+                    "available_area_m2": 0.0,
+                    "manually_entered_area_m2": manually_entered,
+                    "note": (
+                        f"This point appears fully occupied by buildings/roads/water bodies -- "
+                        f"your manually entered {manually_entered:.0f} m2 has been overridden to "
+                        f"0 m2. Try a different location."
+                    ),
+                }
+        else:
+            site_check = {
+                "available_area_m2": available_site_area_m2,
+                "note": (
+                    f"Using your manually entered area ({available_site_area_m2:.0f} m2) as-is -- "
+                    f"the automatic building/road/water check failed "
+                    f"({obstruction_data.get('error', 'unknown error')}), so this number has NOT "
+                    f"been verified against real obstructions. Please confirm on satellite imagery "
+                    f"before construction."
                 ),
             }
 

@@ -25,6 +25,12 @@
       </div>
 
       <div class="panel">
+        <label for="site-area-input">Available site area (m²)</label>
+        <input type="number" id="site-area-input" value="20000" min="0" step="100" style="width:100%; padding:8px 10px; border:1px solid #c7d3c4; border-radius:6px; font-size:0.9rem;" />
+        <p class="hint">Manual estimate — used as a starting point for pond sizing. We still try a quick check for real nearby buildings/roads/water and will cap this number down if any are found; if that check fails, your number is used as-is (unverified). Leave blank to also attempt the full live ownership check.</p>
+      </div>
+
+      <div class="panel">
         <label>Map layer</label>
         <div class="layer-toggle">
           <button id="layer-street" class="layer-btn active">Street</button>
@@ -65,6 +71,11 @@
     </aside>
 
     <main id="map"></main>
+
+    <aside id="explain-panel" class="hidden">
+      <h2>Why this result?</h2>
+      <div id="explain-content"></div>
+    </aside>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

@@ -132,7 +132,8 @@ async function analyzeAndRender(lat, lng, isAutoSuggested, autoSelectedInfo = nu
 
   try {
     const { south, north, west, east } = bboxAroundPoint(lat, lng);
-    const rec = await getPondRecommendation(south, north, west, east, lat, lng);
+    const siteAreaInput = document.getElementById("site-area-input").value;
+    const rec = await getPondRecommendation(south, north, west, east, lat, lng, { siteAreaM2: siteAreaInput });
     renderSiteSummary(rec, lat, lng, autoSelectedInfo);
   } catch (err) {
     resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
@@ -144,7 +145,10 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
   if (rec.catchment && rec.catchment.boundary_geojson) {
     catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
       style: { color: "#2c5a3d", weight: 2, fillColor: "#4a90d9", fillOpacity: 0.25 },
-    }).addTo(map);
+    }).addTo(map).bindTooltip(
+      `Catchment: ${rec.catchment.area_hectares ? rec.catchment.area_hectares + ' ha' : 'area draining to this site'}`,
+      { className: "pond-tooltip", sticky: true }
+    );
   }
 
   const p = rec.pond_recommendation || {};
@@ -166,22 +170,30 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     if (ol.unverified_ownership) {
       ownershipUnverifiedLayer = L.geoJSON(ol.unverified_ownership, {
         style: { color: "#888888", weight: 1, fillColor: "#cccccc", fillOpacity: 0.25, dashArray: "3,3" },
-      }).addTo(map).bindPopup("Ownership unverified — excluded by default");
+      }).addTo(map)
+        .bindTooltip("Ownership unverified — excluded", { className: "pond-tooltip", sticky: true })
+        .bindPopup("Ownership unverified — excluded by default");
     }
     if (ol.private) {
       ownershipPrivateLayer = L.geoJSON(ol.private, {
         style: { color: "#b3413a", weight: 1, fillColor: "#e08c85", fillOpacity: 0.3 },
-      }).addTo(map).bindPopup("Private land — excluded");
+      }).addTo(map)
+        .bindTooltip("Private land — excluded", { className: "pond-tooltip", sticky: true })
+        .bindPopup("Private land — excluded");
     }
     if (ol.government_owned) {
       ownershipGovLayer = L.geoJSON(ol.government_owned, {
         style: { color: "#2c5a3d", weight: 1.5, fillColor: "#a8d5b0", fillOpacity: 0.25 },
-      }).addTo(map).bindPopup(govPopupText);
+      }).addTo(map)
+        .bindTooltip("Government/public land", { className: "pond-tooltip", sticky: true })
+        .bindPopup(govPopupText);
     }
     if (ol.final_eligible) {
       ownershipEligibleLayer = L.geoJSON(ol.final_eligible, {
         style: { color: "#c9962c", weight: 2.5, fillColor: "#f0d264", fillOpacity: 0.45 },
-      }).addTo(map).bindPopup("Final eligible land: government-owned, vacant, unoccupied");
+      }).addTo(map)
+        .bindTooltip("Final eligible land", { className: "pond-tooltip", sticky: true })
+        .bindPopup("Final eligible land: government-owned, vacant, unoccupied");
     }
   }
 
@@ -190,7 +202,9 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
   if (rec.vacant_land_boundary_geojson) {
     vacantLandLayer = L.geoJSON(rec.vacant_land_boundary_geojson, {
       style: { color: "#8a5a2b", weight: 2, fillColor: "#e8d5a8", fillOpacity: 0.35, dashArray: "6,4" },
-    }).addTo(map).bindPopup("Selected eligible patch (closest to this site)");
+    }).addTo(map)
+      .bindTooltip("Selected eligible patch", { className: "pond-tooltip", sticky: true })
+      .bindPopup("Selected eligible patch (closest to this site)");
   }
 
   if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
@@ -201,7 +215,9 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     pondFootprintLayer = L.rectangle(
       [[lat - halfSideDegLat, lng - halfSideDegLon], [lat + halfSideDegLat, lng + halfSideDegLon]],
       { color: "#d9534f", weight: 2, fillColor: "#d9534f", fillOpacity: 0.4 }
-    ).addTo(map).bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
+    ).addTo(map)
+      .bindTooltip(`Pond: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`, { className: "pond-tooltip", sticky: true })
+      .bindPopup(`Proposed pond footprint: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m`);
   }
 
   const sufficiencyNote = p.cannot_recommend
@@ -224,10 +240,12 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
       <div class="result-row"><span class="label">Private land (excluded)</span><span class="value">${b.private_area_m2.toLocaleString()} m²</span></div>
       <div class="result-row"><span class="label">Ownership unverified (excluded)</span><span class="value">${b.unverified_ownership_area_m2.toLocaleString()} m²</span></div>
       <div class="result-row"><span class="label"><strong>Final eligible area</strong></span><span class="value"><strong>${b.final_eligible_vacant_government_area_m2.toLocaleString()} m²</strong></span></div>
-      <p class="hint" style="margin-top:6px;">${sc.limitation}</p>
+      <p class="hint" style="margin-top:6px;">${sc.limitation || sc.source || ""}</p>
     `;
   } else if (sc && sc.note) {
     siteCheckNote = `<p class="hint" style="color:#b3413a;">⚠ ${sc.note}</p>`;
+  } else {
+    siteCheckNote = `<p class="hint">Using manually entered site area — live ownership/obstruction check was skipped.</p>`;
   }
 
   const soil = rec.soil_check;
@@ -272,6 +290,98 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ${siteCheckNote}
     ${catchmentClippedNote}
   `;
+
+  renderExplanationPanel(rec);
+}
+
+// Builds the plain-language "Why this result?" panel on the right, explaining
+// WHY the recommended area is the size it is -- what got subtracted and why
+// (roads, buildings, water, private land, unverified ownership), rather than
+// just restating the numbers already in the Site Summary.
+function renderExplanationPanel(rec) {
+  const panel = document.getElementById("explain-panel");
+  const content = document.getElementById("explain-content");
+  const sc = rec.site_check;
+  const p = rec.pond_recommendation || {};
+
+  let html = "";
+
+  // Block 1: catchment context, if available
+  if (rec.catchment) {
+    html += `
+      <div class="explain-block">
+        <h3>Catchment</h3>
+        <p>This site collects rainfall runoff from <strong>${rec.catchment.area_hectares} hectares</strong> of surrounding land — the terrain naturally drains here, which is why it was chosen (or why you clicked here).</p>
+      </div>
+    `;
+  }
+
+  // Block 2: the actual "why only this much area" breakdown
+  if (sc && sc.area_breakdown) {
+    const b = sc.area_breakdown;
+    const isLandRecord = sc.source === "user-uploaded land record (not OSM heuristic)";
+    html += `
+      <div class="explain-block">
+        <h3>Why the eligible area is limited</h3>
+        <p>${isLandRecord
+          ? "Your uploaded land record was checked parcel-by-parcel. Only parcels explicitly classified as government/public land count as eligible — everything else is subtracted below."
+          : "OpenStreetMap data was checked for real buildings, roads, water bodies, and land tagged as government/public. Only land meeting ALL of these is eligible — everything else is subtracted below."}</p>
+        <div class="explain-stat-row"><span>Government-owned land found</span><span class="val">${b.government_owned_area_m2.toLocaleString()} m²</span></div>
+        <div class="explain-stat-row subtract"><span>Occupied by buildings/roads/water</span><span class="val">${b.government_area_occupied_by_development_m2.toLocaleString()} m²</span></div>
+        <div class="explain-stat-row total"><span>Final eligible land</span><span class="val">${b.final_eligible_vacant_government_area_m2.toLocaleString()} m²</span></div>
+        <p style="margin-top:8px;">For reference, nearby land also includes <strong>${b.private_area_m2.toLocaleString()} m²</strong> of private property and <strong>${b.unverified_ownership_area_m2.toLocaleString()} m²</strong> of land whose ownership couldn't be confirmed — both are excluded on principle, since a pond can only be built on land that's actually available for public use.</p>
+      </div>
+    `;
+  } else if (sc && sc.manually_entered_area_m2 !== undefined) {
+    html += `
+      <div class="explain-block">
+        <h3>Why the area was adjusted</h3>
+        <p>You entered <strong>${sc.manually_entered_area_m2.toLocaleString()} m²</strong> as an estimate. We checked OpenStreetMap for real buildings, roads, and water bodies within 150m of this exact point.</p>
+        ${sc.real_vacant_patch_area_m2 !== undefined ? `
+          <div class="explain-stat-row"><span>Your estimate</span><span class="val">${sc.manually_entered_area_m2.toLocaleString()} m²</span></div>
+          <div class="explain-stat-row"><span>Real open land found nearby</span><span class="val">${sc.real_vacant_patch_area_m2.toLocaleString()} m²</span></div>
+          <div class="explain-stat-row total"><span>Used for sizing (smaller of the two)</span><span class="val">${sc.available_area_m2.toLocaleString()} m²</span></div>
+          <p style="margin-top:8px;">${(sc.buildings_found_nearby || 0)} building(s), ${(sc.roads_found_nearby || 0)} road(s), and ${(sc.water_bodies_found_nearby || 0)} water body/ies were found nearby — these are excluded from the buildable area, which is why the number was reduced.</p>
+        ` : `<p style="color:#b3413a;">${sc.note}</p>`}
+      </div>
+    `;
+  } else if (sc && sc.note) {
+    html += `
+      <div class="explain-block">
+        <h3>Land check unavailable</h3>
+        <p style="color:#b3413a;">${sc.note}</p>
+      </div>
+    `;
+  } else {
+    html += `
+      <div class="explain-block">
+        <h3>No land eligibility check performed</h3>
+        <p>This result uses your manually entered area directly, with no automatic check against real buildings, roads, or water bodies. Verify the site on satellite imagery before construction.</p>
+      </div>
+    `;
+  }
+
+  // Block 3: what the sizing means in practice
+  if (!p.cannot_recommend && p.recommended_surface_area_m2) {
+    const capturedPct = p.percent_of_annual_runoff_captured;
+    html += `
+      <div class="explain-block">
+        <h3>What this means for the pond</h3>
+        <p>With <strong>${(sc && sc.available_area_m2 !== undefined ? sc.available_area_m2 : sc && sc.area_breakdown ? sc.area_breakdown.final_eligible_vacant_government_area_m2 : "the available").toLocaleString()} m²</strong> of usable land, the largest practical pond here is <strong>${p.recommended_surface_area_m2.toLocaleString()} m²</strong> at <strong>${p.recommended_depth_m}m</strong> deep — capturing about <strong>${capturedPct}%</strong> of this site's annual runoff.</p>
+        ${!p.site_area_sufficient_for_target ? `<p style="color:#b3413a;">This falls short of the ${(p.target_capture_fraction*100).toFixed(0)}% target because the catchment is large relative to the available land. A larger site, or a second pond elsewhere in the catchment, would capture more.</p>` : ""}
+      </div>
+    `;
+  } else if (p.cannot_recommend) {
+    html += `
+      <div class="explain-block">
+        <h3>Why no pond is recommended</h3>
+        <p style="color:#b3413a;">${p.reason || "No eligible land was found at this location."}</p>
+      </div>
+    `;
+  }
+
+  content.innerHTML = html;
+  panel.classList.remove("hidden");
 }
 
 // ---- Auto-suggest the best (lowest-elevation) pond site within the searched village ----
@@ -287,7 +397,8 @@ document.getElementById("suggest-site-btn").addEventListener("click", async () =
 
   try {
     const { south, north, west, east } = lastVillageBbox;
-    const rec = await suggestPondSite(south, north, west, east);
+    const siteAreaInput = document.getElementById("site-area-input").value;
+    const rec = await suggestPondSite(south, north, west, east, { siteAreaM2: siteAreaInput });
     const { lat, lon } = rec.location;
     if (siteMarker) map.removeLayer(siteMarker);
     siteMarker = L.marker([lat, lon], {
@@ -411,6 +522,7 @@ document.getElementById("contours-btn").addEventListener("click", async () => {
         return { color: elevationColorRamp(t), weight: 1.5, opacity: 0.85 };
       },
       onEachFeature: (feature, layer) => {
+        layer.bindTooltip(`${feature.properties.elevation_m} m`, { className: "pond-tooltip", sticky: true });
         layer.bindPopup(`Elevation: ${feature.properties.elevation_m} m`);
       },
     }).addTo(map);

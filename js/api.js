@@ -51,6 +51,9 @@ async function getPondRecommendation(south, north, west, east, pourLat, pourLon,
     land_cover: options.landCover || "cultivated_land",
     target_capture_fraction: options.targetFraction || 0.5,
   });
+  if (options.siteAreaM2 !== undefined && options.siteAreaM2 !== null && options.siteAreaM2 !== "") {
+    params.set("available_site_area_m2", options.siteAreaM2);
+  }
   const url = `${API_BASE}/api/pond/recommend?${params.toString()}`;
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -66,6 +69,9 @@ async function suggestPondSite(south, north, west, east, options = {}) {
     land_cover: options.landCover || "cultivated_land",
     target_capture_fraction: options.targetFraction || 0.5,
   });
+  if (options.siteAreaM2 !== undefined && options.siteAreaM2 !== null && options.siteAreaM2 !== "") {
+    params.set("available_site_area_m2", options.siteAreaM2);
+  }
   const url = `${API_BASE}/api/pond/suggest-site?${params.toString()}`;
   const resp = await fetch(url);
   if (!resp.ok) {

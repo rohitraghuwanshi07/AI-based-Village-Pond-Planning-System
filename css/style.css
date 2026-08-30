@@ -30,6 +30,90 @@ html, body {
   color: #2c5a3d;
 }
 
+#explain-panel {
+  width: 320px;
+  min-width: 320px;
+  background: #fdfaf3;
+  border-left: 1px solid #e8dfc4;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+#explain-panel.hidden {
+  display: none;
+}
+
+#explain-panel h2 {
+  font-size: 1rem;
+  margin: 0 0 14px 0;
+  color: #8a5a2b;
+}
+
+.explain-block {
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed #e8dfc4;
+}
+
+.explain-block:last-child {
+  border-bottom: none;
+}
+
+.explain-block h3 {
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #6b7a70;
+  margin: 0 0 6px 0;
+}
+
+.explain-block p {
+  font-size: 0.88rem;
+  line-height: 1.5;
+  margin: 0 0 6px 0;
+  color: #1f2a24;
+}
+
+.explain-stat-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  padding: 3px 0;
+  color: #4a5a4f;
+}
+
+.explain-stat-row .val {
+  font-weight: 600;
+  color: #1f2a24;
+}
+
+.explain-stat-row.subtract .val::before {
+  content: "− ";
+  color: #b3413a;
+}
+
+.explain-stat-row.total {
+  border-top: 1px solid #e8dfc4;
+  margin-top: 4px;
+  padding-top: 6px;
+  font-weight: 700;
+}
+
+/* Leaflet hover tooltips -- lighter/faster than click-popups */
+.leaflet-tooltip.pond-tooltip {
+  background: rgba(31, 42, 36, 0.92);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  padding: 4px 8px;
+  box-shadow: none;
+}
+.leaflet-tooltip.pond-tooltip::before {
+  border-top-color: rgba(31, 42, 36, 0.92);
+}
+
+
 .panel {
   margin-bottom: 22px;
   padding-bottom: 18px;
