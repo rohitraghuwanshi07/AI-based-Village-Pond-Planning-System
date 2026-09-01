@@ -20,6 +20,7 @@ from tempfile import SpooledTemporaryFile
 
 import numpy as np
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.responses import HTMLResponse
 from skimage import measure
 
 from app.services.kml_parser import parse_contour_file
@@ -329,4 +330,165 @@ async def demo_catchment():
         max_slope_deg=8.0,
     )
 
+@router.get("/api/catchment/upload", response_class=HTMLResponse, tags=["contour-analysis"])
+async def catchment_upload_page():
+    """Browser-based contour map upload interface."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Village Pond Planning System</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 700px;
+                margin: 50px auto;
+                padding: 20px;
+                background: #f5f7fa;
+            }
 
+            .card {
+                background: white;
+                padding: 30px;
+                border-radius: 12px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            }
+
+            h1 {
+                margin-top: 0;
+            }
+
+            label {
+                display: block;
+                margin-top: 18px;
+                margin-bottom: 6px;
+                font-weight: bold;
+            }
+
+            input {
+                width: 100%;
+                padding: 10px;
+                box-sizing: border-box;
+            }
+
+            button {
+                margin-top: 25px;
+                padding: 12px 20px;
+                font-size: 16px;
+                cursor: pointer;
+            }
+
+            #status {
+                margin-top: 20px;
+                white-space: pre-wrap;
+            }
+
+            pre {
+                background: #f0f0f0;
+                padding: 15px;
+                overflow-x: auto;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="card">
+            <h1>Village Pond Planning System</h1>
+            <p>Upload a KML or KMZ contour map to estimate the catchment area and recommend a pond site.</p>
+
+            <form id="uploadForm">
+                <label for="file">Contour Map (.kml / .kmz)</label>
+                <input
+                    type="file"
+                    id="file"
+                    name="file"
+                    accept=".kml,.kmz"
+                    required
+                >
+
+                <label for="resolution_m">Resolution (meters)</label>
+                <input
+                    type="number"
+                    id="resolution_m"
+                    name="resolution_m"
+                    value="10"
+                    min="2"
+                    max="50"
+                    step="1"
+                >
+
+                <label for="max_slope_deg">Maximum Suitable Slope (degrees)</label>
+                <input
+                    type="number"
+                    id="max_slope_deg"
+                    name="max_slope_deg"
+                    value="8"
+                    min="1"
+                    max="45"
+                    step="1"
+                >
+
+                <button type="submit">Analyze Catchment</button>
+            </form>
+
+            <div id="status"></div>
+            <div id="result"></div>
+        </div>
+
+        <script>
+            const form = document.getElementById("uploadForm");
+            const status = document.getElementById("status");
+            const result = document.getElementById("result");
+
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+
+                const fileInput = document.getElementById("file");
+
+                if (!fileInput.files.length) {
+                    status.textContent = "Please select a KML or KMZ file.";
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append("file", fileInput.files[0]);
+
+                const resolution = document.getElementById("resolution_m").value;
+                const maxSlope = document.getElementById("max_slope_deg").value;
+
+                status.textContent =
+                    "Processing contour map... This may take a few minutes.";
+
+                result.innerHTML = "";
+
+                try {
+                    const response = await fetch(
+                        `/api/findCatchment?resolution_m=${encodeURIComponent(resolution)}&max_slope_deg=${encodeURIComponent(maxSlope)}`,
+                        {
+                            method: "POST",
+                            body: formData
+                        }
+                    );
+
+                    const data = await response.json();
+
+                    if (!response.ok) {
+                        throw new Error(data.detail || "API request failed.");
+                    }
+
+                    status.textContent = "Analysis completed successfully.";
+
+                    result.innerHTML = `
+                        <h2>Results</h2>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    `;
+                } catch (error) {
+                    status.textContent = "Analysis failed.";
+                    result.innerHTML = `<pre>${error.message}</pre>`;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
