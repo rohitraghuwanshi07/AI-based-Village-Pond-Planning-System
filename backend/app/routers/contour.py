@@ -15,6 +15,8 @@ Pipeline (each stage reuses/extends the same engines built in Phase 1):
 """
 
 import time
+from pathlib import Path
+from tempfile import SpooledTemporaryFile
 
 import numpy as np
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -287,3 +289,44 @@ async def find_catchment(
 ):
     """Alias of /api/analyzeContour (same behavior, alternate route name per assignment wording)."""
     return await _analyze_contour_impl(file, resolution_m, max_slope_deg)
+
+
+@router.get("/api/demo/catchment", tags=["contour-analysis"])
+async def demo_catchment():
+    """
+    Browser-friendly demonstration endpoint.
+
+    Automatically processes the sample contour map:
+    backend/test_data/contours_1m.kml
+    """
+    sample_file = (
+        Path(__file__).resolve().parents[2]
+        / "test_data"
+        / "contours_1m.kml"
+    )
+
+    if not sample_file.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sample contour file not found: {sample_file}",
+        )
+
+    with open(sample_file, "rb") as f:
+        file_bytes = f.read()
+
+    temp_file = SpooledTemporaryFile()
+    temp_file.write(file_bytes)
+    temp_file.seek(0)
+
+    upload = UploadFile(
+        file=temp_file,
+        filename="contours_1m.kml",
+    )
+
+    return await _analyze_contour_impl(
+        upload,
+        resolution_m=10.0,
+        max_slope_deg=8.0,
+    )
+
+
