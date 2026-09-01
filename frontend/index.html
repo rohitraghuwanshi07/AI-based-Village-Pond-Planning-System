@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Village Pond Planning System</title>
+
+  <!-- Leaflet CSS/JS from a free CDN -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <div id="app">
+    <aside id="sidebar">
+      <h1>🌾 Village Pond Planner</h1>
+
+      <div class="panel">
+        <label for="village-search">Search village</label>
+        <div class="search-row">
+          <input type="text" id="village-search" placeholder="e.g. Nagpur" />
+          <button id="search-btn">Search</button>
+        </div>
+        <p id="search-status" class="status-text"></p>
+      </div>
+
+      <div class="panel">
+        <label for="site-area-input">Available site area (m²)</label>
+        <input type="number" id="site-area-input" value="20000" min="0" step="100" style="width:100%; padding:8px 10px; border:1px solid #c7d3c4; border-radius:6px; font-size:0.9rem;" />
+        <p class="hint">Manual estimate — used as a starting point for pond sizing. We still try a quick check for real nearby buildings/roads/water and will cap this number down if any are found; if that check fails, your number is used as-is (unverified). Leave blank to also attempt the full live ownership check.</p>
+      </div>
+
+      <div class="panel">
+        <label>Map layer</label>
+        <div class="layer-toggle">
+          <button id="layer-street" class="layer-btn active">Street</button>
+          <button id="layer-satellite" class="layer-btn">Satellite</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <button id="contours-btn" class="layer-btn full-width" disabled>Show Contours</button>
+        <p class="hint">Search a village first, then load its contour lines (may take 10-20s).</p>
+        <div id="contour-legend" class="contour-legend hidden">
+          <span class="legend-label">Low</span>
+          <div class="legend-gradient"></div>
+          <span class="legend-label">High</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <button id="suggest-site-btn" class="layer-btn full-width suggest-btn" disabled>⭐ Suggest Best Pond Site</button>
+        <p class="hint">Automatically finds the lowest-elevation, best-draining spot in this area (may take 20-50s).</p>
+      </div>
+
+      <div class="panel">
+        <p class="hint">Click anywhere on the map to select a candidate pond site.</p>
+      </div>
+
+      <div class="panel landrecord-panel">
+        <label for="landrecord-file">Upload land record (GeoJSON/KML)</label>
+        <p class="hint">Use an actual Bhu-Naksha-style parcel document instead of the OSM ownership guess — stronger, more defensible eligibility check.</p>
+        <input type="file" id="landrecord-file" accept=".geojson,.json,.kml" />
+        <button id="landrecord-btn" class="layer-btn full-width suggest-btn" style="margin-top:8px;" disabled>📄 Find Site From Land Record</button>
+      </div>
+
+      <div id="results-panel" class="panel results hidden">
+        <h2>Site Summary</h2>
+        <div id="results-content"></div>
+      </div>
+    </aside>
+
+    <main id="map"></main>
+
+    <aside id="explain-panel" class="hidden">
+      <h2>Why this result?</h2>
+      <div id="explain-content"></div>
+    </aside>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/map.js"></script>
+</body>
+</html>
