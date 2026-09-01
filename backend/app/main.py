@@ -38,11 +38,20 @@ def root():
     }
 
 
+@app.get("/", tags=["system"])
+def root():
+    """Root endpoint — confirms the API is running."""
+    return {
+        "message": "Village Pond Planning System API is running",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
+
+
 @app.get("/api/health", tags=["system"])
 def health_check():
     """Simple liveness check — confirms the server is up."""
     return {"status": "ok", "service": "village-pond-planner"}
-
 
 app.include_router(village.router)
 app.include_router(rainfall.router)
