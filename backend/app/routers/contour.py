@@ -99,9 +99,10 @@ async def _analyze_contour_impl(
     timings = {}
     t_start = time.time()
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 1. READ + PARSE CONTOUR FILE
-    # ---------------------------------------------------------
+    # =========================================================
+
     file_bytes = await file.read()
 
     if not file_bytes:
@@ -135,9 +136,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 2. RASTERIZE CONTOURS
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     try:
@@ -156,9 +158,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 3. SLOPE
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     slope = compute_slope_degrees(
@@ -171,9 +174,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
-    # 4. FLOW DIRECTION + ACCUMULATION
-    # ---------------------------------------------------------
+    # =========================================================
+    # 4. FLOW DIRECTION + FLOW ACCUMULATION
+    # =========================================================
+
     t = time.time()
 
     filled = fill_depressions(elevation)
@@ -198,9 +202,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 5. AUTOMATIC POND SITE SELECTION
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     row, col, site_info = select_pond_site(
@@ -215,9 +220,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 6. CATCHMENT DELINEATION
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     catchment_mask = delineate_catchment(
@@ -250,21 +256,23 @@ async def _analyze_contour_impl(
         * cell_area_m2
     )
 
-    # ---------------------------------------------------------
-    # 7. LAND + OWNERSHIP CHECKS
+    # =========================================================
+    # 7. LAND USE + OWNERSHIP
     #
     # Full API:
     #     include_external_checks=True
     #
     # Browser demo:
     #     include_external_checks=False
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     vacant_land_boundary_geojson = None
     ownership_layers = None
 
     if include_external_checks:
+
         obstruction_data = await fetch_obstructions(
             site_lat,
             site_lon,
@@ -281,14 +289,19 @@ async def _analyze_contour_impl(
             obstruction_data["query_succeeded"]
             and ownership_data["query_succeeded"]
         ):
+
             patch_result = find_eligible_patches(
                 site_lat,
                 site_lon,
                 buildings=obstruction_data["buildings"],
                 roads=obstruction_data["roads"],
                 water=obstruction_data["water"],
-                government_zones=ownership_data["government_zones"],
-                private_zones=ownership_data["private_zones"],
+                government_zones=ownership_data[
+                    "government_zones"
+                ],
+                private_zones=ownership_data[
+                    "private_zones"
+                ],
                 search_radius_m=150.0,
             )
 
@@ -298,79 +311,106 @@ async def _analyze_contour_impl(
 
             if (
                 patch_result["patches"]
-                and patch_result["selected_patch_index"]
-                is not None
+                and patch_result[
+                    "selected_patch_index"
+                ] is not None
             ):
-                selected_patch = patch_result["patches"][
-                    patch_result["selected_patch_index"]
+
+                selected_patch = patch_result[
+                    "patches"
+                ][
+                    patch_result[
+                        "selected_patch_index"
+                    ]
                 ]
 
-                available_area_m2 = selected_patch[
-                    "area_m2"
-                ]
+                available_area_m2 = (
+                    selected_patch["area_m2"]
+                )
 
                 vacant_land_boundary_geojson = (
-                    selected_patch["boundary_geojson"]
+                    selected_patch[
+                        "boundary_geojson"
+                    ]
                 )
 
                 site_check = {
-                    "available_area_m2": available_area_m2,
-                    "area_breakdown": patch_result[
-                        "area_breakdown"
-                    ],
-                    "total_separate_eligible_patches_found": len(
-                        patch_result["patches"]
-                    ),
-                    "government_zones_found_nearby": patch_result[
-                        "government_zones_found_nearby"
-                    ],
-                    "private_zones_found_nearby": patch_result[
-                        "private_zones_found_nearby"
-                    ],
-                    "buildings_found_nearby": patch_result[
-                        "buildings_found_nearby"
-                    ],
-                    "roads_found_nearby": patch_result[
-                        "roads_found_nearby"
-                    ],
-                    "water_bodies_found_nearby": patch_result[
-                        "water_bodies_found_nearby"
-                    ],
-                    "limitation": patch_result[
-                        "ownership_data_limitation"
-                    ],
+                    "available_area_m2":
+                        available_area_m2,
+                    "area_breakdown":
+                        patch_result[
+                            "area_breakdown"
+                        ],
+                    "total_separate_eligible_patches_found":
+                        len(
+                            patch_result["patches"]
+                        ),
+                    "government_zones_found_nearby":
+                        patch_result[
+                            "government_zones_found_nearby"
+                        ],
+                    "private_zones_found_nearby":
+                        patch_result[
+                            "private_zones_found_nearby"
+                        ],
+                    "buildings_found_nearby":
+                        patch_result[
+                            "buildings_found_nearby"
+                        ],
+                    "roads_found_nearby":
+                        patch_result[
+                            "roads_found_nearby"
+                        ],
+                    "water_bodies_found_nearby":
+                        patch_result[
+                            "water_bodies_found_nearby"
+                        ],
+                    "limitation":
+                        patch_result[
+                            "ownership_data_limitation"
+                        ],
                 }
 
             else:
+
                 available_area_m2 = 0.0
 
                 site_check = {
                     "available_area_m2": 0.0,
-                    "area_breakdown": patch_result[
-                        "area_breakdown"
-                    ],
-                    "total_separate_eligible_patches_found": 0,
-                    "government_zones_found_nearby": patch_result[
-                        "government_zones_found_nearby"
-                    ],
-                    "private_zones_found_nearby": patch_result[
-                        "private_zones_found_nearby"
-                    ],
-                    "buildings_found_nearby": patch_result[
-                        "buildings_found_nearby"
-                    ],
-                    "roads_found_nearby": patch_result[
-                        "roads_found_nearby"
-                    ],
-                    "water_bodies_found_nearby": patch_result[
-                        "water_bodies_found_nearby"
-                    ],
-                    "limitation": patch_result[
-                        "ownership_data_limitation"
-                    ],
+                    "area_breakdown":
+                        patch_result[
+                            "area_breakdown"
+                        ],
+                    "total_separate_eligible_patches_found":
+                        0,
+                    "government_zones_found_nearby":
+                        patch_result[
+                            "government_zones_found_nearby"
+                        ],
+                    "private_zones_found_nearby":
+                        patch_result[
+                            "private_zones_found_nearby"
+                        ],
+                    "buildings_found_nearby":
+                        patch_result[
+                            "buildings_found_nearby"
+                        ],
+                    "roads_found_nearby":
+                        patch_result[
+                            "roads_found_nearby"
+                        ],
+                    "water_bodies_found_nearby":
+                        patch_result[
+                            "water_bodies_found_nearby"
+                        ],
+                    "limitation":
+                        patch_result[
+                            "ownership_data_limitation"
+                        ],
                 }
 
         else:
+
             failed_reasons = []
 
             if not obstruction_data[
@@ -401,6 +441,7 @@ async def _analyze_contour_impl(
             }
 
     else:
+
         # Fast browser demo mode
         available_area_m2 = 0.0
 
@@ -418,9 +459,10 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 8. RAINFALL + RUNOFF
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     rainfall_result = await get_historical_rainfall(
@@ -429,14 +471,19 @@ async def _analyze_contour_impl(
         years=10,
     )
 
-    dates = rainfall_result["daily_series"]["dates"]
+    dates = rainfall_result[
+        "daily_series"
+    ]["dates"]
 
     daily_values = rainfall_result[
         "daily_series"
     ]["precipitation_mm"]
 
     years_seen = sorted(
-        set(d[:4] for d in dates)
+        set(
+            d[:4]
+            for d in dates
+        )
     )
 
     complete_years = (
@@ -452,6 +499,7 @@ async def _analyze_contour_impl(
     annual_runoff_depths = []
 
     for year in complete_years:
+
         year_values = [
             v
             for d, v in zip(
@@ -482,7 +530,8 @@ async def _analyze_contour_impl(
     )
 
     avg_annual_runoff_volume_m3 = (
-        avg_annual_runoff_depth_mm / 1000
+        avg_annual_runoff_depth_mm
+        / 1000
     ) * catchment_area_m2
 
     timings["rainfall_runoff_seconds"] = round(
@@ -490,17 +539,21 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 9. SOIL CHECK
-    # ---------------------------------------------------------
+    # =========================================================
+
     t = time.time()
 
     if include_external_checks:
+
         soil_check = await fetch_soil_composition(
             site_lat,
             site_lon,
         )
+
     else:
+
         soil_check = {
             "query_succeeded": False,
             "status": "skipped",
@@ -515,12 +568,17 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 10. POND SIZING
-    # ---------------------------------------------------------
+    # =========================================================
+
     pond_sizing = recommend_pond(
-        required_volume_m3=avg_annual_runoff_volume_m3,
-        available_site_area_m2=available_area_m2,
+        required_volume_m3=(
+            avg_annual_runoff_volume_m3
+        ),
+        available_site_area_m2=(
+            available_area_m2
+        ),
         target_capture_fraction=0.5,
     )
 
@@ -529,46 +587,57 @@ async def _analyze_contour_impl(
         2,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # 11. RESPONSE
-    # ---------------------------------------------------------
+    # =========================================================
+
     return {
+
         "input_file": {
             "filename": file.filename,
-            "format_detected": parse_result.source_format,
-            "contour_lines_parsed": len(
-                parse_result.lines
-            ),
-            "contour_lines_skipped": (
-                parse_result.lines_skipped
-            ),
+            "format_detected":
+                parse_result.source_format,
+            "contour_lines_parsed":
+                len(parse_result.lines),
+            "contour_lines_skipped":
+                parse_result.lines_skipped,
         },
 
         "terrain_summary": {
-            "bounding_box": raster_meta["bbox"],
-            "raster_shape_rows_cols": (
-                raster_meta["raster_shape"]
-            ),
-            "raster_resolution_m": (
-                raster_meta["resolution_m_used"]
-            ),
-            "elevation_range_m": (
-                raster_meta["elevation_range_m"]
-            ),
-            "mean_slope_deg": round(
-                float(np.nanmean(slope)),
-                2,
-            ),
+            "bounding_box":
+                raster_meta["bbox"],
+            "raster_shape_rows_cols":
+                raster_meta[
+                    "raster_shape"
+                ],
+            "raster_resolution_m":
+                raster_meta[
+                    "resolution_m_used"
+                ],
+            "elevation_range_m":
+                raster_meta[
+                    "elevation_range_m"
+                ],
+            "mean_slope_deg":
+                round(
+                    float(
+                        np.nanmean(slope)
+                    ),
+                    2,
+                ),
         },
 
         "recommended_pond_site": {
             "lat": site_lat,
             "lon": site_lon,
             "elevation_m": round(
-                float(elevation[row, col]),
+                float(
+                    elevation[row, col]
+                ),
                 1,
             ),
-            "selection_method": site_info,
+            "selection_method":
+                site_info,
         },
 
         "catchment": {
@@ -583,59 +652,64 @@ async def _analyze_contour_impl(
             "cell_count": int(
                 catchment_mask.sum()
             ),
-            "boundary_geojson": catchment_geojson,
+            "boundary_geojson":
+                catchment_geojson,
         },
 
         "rainfall_and_runoff": {
-            "years_analyzed": len(
-                complete_years
-            ),
-            "annual_average_rainfall_mm": (
+            "years_analyzed":
+                len(complete_years),
+            "annual_average_rainfall_mm":
                 rainfall_result[
                     "annual_average_mm"
-                ]
-            ),
-            "curve_number_used": curve_number,
-            "avg_annual_runoff_volume_m3": round(
-                avg_annual_runoff_volume_m3,
-                1,
-            ),
+                ],
+            "curve_number_used":
+                curve_number,
+            "avg_annual_runoff_volume_m3":
+                round(
+                    avg_annual_runoff_volume_m3,
+                    1,
+                ),
         },
 
         "site_check": site_check,
 
-        "vacant_land_boundary_geojson": (
-            vacant_land_boundary_geojson
-        ),
+        "vacant_land_boundary_geojson":
+            vacant_land_boundary_geojson,
 
-        "ownership_layers": ownership_layers,
+        "ownership_layers":
+            ownership_layers,
 
-        "soil_check": soil_check,
+        "soil_check":
+            soil_check,
 
-        "pond_sizing_recommendation": pond_sizing,
+        "pond_sizing_recommendation":
+            pond_sizing,
 
         "methodology": (
-            "Contour lines were parsed from the uploaded "
-            "file and interpolated into a continuous "
-            "elevation raster (linear interpolation over "
-            "scattered elevation points sampled along each "
-            "line). Slope was computed via finite-difference "
-            "gradient. Flow direction/accumulation were "
-            "computed using a D8 algorithm (priority-flood "
-            "depression filling + steepest-descent routing). "
-            "The pond site was chosen as the highest-"
-            "flow-accumulation cell among low-slope "
-            "candidates. The catchment was delineated via "
-            "reverse breadth-first search over the "
-            "flow-direction graph, upstream from the "
-            "selected site. Real building/road data from "
-            "OpenStreetMap can be checked near the selected "
-            "site in full-analysis mode. No coordinates or "
-            "results are hard-coded -- everything is derived "
-            "from the uploaded file."
+            "Contour lines were parsed from the "
+            "uploaded file and interpolated into "
+            "a continuous elevation raster "
+            "(linear interpolation over scattered "
+            "elevation points sampled along each "
+            "line). Slope was computed via "
+            "finite-difference gradient. Flow "
+            "direction/accumulation were computed "
+            "using a D8 algorithm (priority-flood "
+            "depression filling + steepest-descent "
+            "routing). The pond site was chosen as "
+            "the highest-flow-accumulation cell "
+            "among low-slope candidates. The "
+            "catchment was delineated via reverse "
+            "breadth-first search over the "
+            "flow-direction graph, upstream from "
+            "the selected site. No coordinates or "
+            "results are hard-coded -- everything "
+            "is derived from the uploaded file."
         ),
 
-        "processing_time_seconds": timings,
+        "processing_time_seconds":
+            timings,
     }
 
 
@@ -776,21 +850,30 @@ async def catchment_upload_page():
     """
     Browser-based contour map upload interface.
 
-    Users can upload any KML or KMZ file directly from
-    their browser.
+    Users can upload any KML or KMZ file directly
+    from their browser.
     """
 
     return """
     <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
 
-        <title>Village Pond Planning System</title>
+    <html>
+
+    <head>
+
+        <meta charset="UTF-8">
+
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+
+        <title>
+            Village Pond Planning System
+        </title>
 
         <style>
+
             * {
                 box-sizing: border-box;
             }
@@ -813,7 +896,8 @@ async def catchment_upload_page():
                 padding: 32px;
                 border-radius: 14px;
                 box-shadow:
-                    0 4px 20px rgba(0, 0, 0, 0.08);
+                    0 4px 20px
+                    rgba(0, 0, 0, 0.08);
             }
 
             h1 {
@@ -884,9 +968,11 @@ async def catchment_upload_page():
             }
 
             @keyframes spin {
+
                 to {
                     transform: rotate(360deg);
                 }
+
             }
 
             #result {
@@ -896,7 +982,10 @@ async def catchment_upload_page():
             .results-grid {
                 display: grid;
                 grid-template-columns:
-                    repeat(auto-fit, minmax(200px, 1fr));
+                    repeat(
+                        auto-fit,
+                        minmax(200px, 1fr)
+                    );
                 gap: 15px;
                 margin-top: 15px;
             }
@@ -950,7 +1039,19 @@ async def catchment_upload_page():
                 color: #166534;
                 border: 1px solid #bbf7d0;
             }
+
+            .info-box {
+                margin-top: 12px;
+                padding: 12px;
+                border-radius: 8px;
+                background: #eff6ff;
+                color: #1e40af;
+                font-size: 14px;
+                line-height: 1.5;
+            }
+
         </style>
+
     </head>
 
     <body>
@@ -964,14 +1065,26 @@ async def catchment_upload_page():
                 </h1>
 
                 <div class="subtitle">
-                    Upload any KML or KMZ contour map to
-                    reconstruct terrain, identify a suitable
-                    pond location, and estimate the catchment.
+
+                    Upload any KML or KMZ contour map
+                    to reconstruct terrain, identify a
+                    suitable pond location, and estimate
+                    the catchment area.
+
+                </div>
+
+                <div class="info-box">
+
+                    Analysis may take a few minutes
+                    depending on the size and complexity
+                    of the contour map.
+
                 </div>
 
                 <form id="uploadForm">
 
                     <div class="field">
+
                         <label for="file">
                             Contour Map (.kml / .kmz)
                         </label>
@@ -983,9 +1096,11 @@ async def catchment_upload_page():
                             accept=".kml,.kmz"
                             required
                         >
+
                     </div>
 
                     <div class="field">
+
                         <label for="resolution_m">
                             Raster Resolution (meters)
                         </label>
@@ -998,11 +1113,14 @@ async def catchment_upload_page():
                             max="50"
                             step="1"
                         >
+
                     </div>
 
                     <div class="field">
+
                         <label for="max_slope_deg">
-                            Maximum Suitable Slope (degrees)
+                            Maximum Suitable Slope
+                            (degrees)
                         </label>
 
                         <input
@@ -1013,6 +1131,7 @@ async def catchment_upload_page():
                             max="45"
                             step="1"
                         >
+
                     </div>
 
                     <button
@@ -1033,26 +1152,41 @@ async def catchment_upload_page():
         </div>
 
         <script>
+
             const form =
-                document.getElementById("uploadForm");
+                document.getElementById(
+                    "uploadForm"
+                );
 
             const fileInput =
-                document.getElementById("file");
+                document.getElementById(
+                    "file"
+                );
 
             const resolutionInput =
-                document.getElementById("resolution_m");
+                document.getElementById(
+                    "resolution_m"
+                );
 
             const slopeInput =
-                document.getElementById("max_slope_deg");
+                document.getElementById(
+                    "max_slope_deg"
+                );
 
             const button =
-                document.getElementById("analyzeButton");
+                document.getElementById(
+                    "analyzeButton"
+                );
 
             const status =
-                document.getElementById("status");
+                document.getElementById(
+                    "status"
+                );
 
             const result =
-                document.getElementById("result");
+                document.getElementById(
+                    "result"
+                );
 
 
             form.addEventListener(
@@ -1061,14 +1195,21 @@ async def catchment_upload_page():
 
                     event.preventDefault();
 
-                    if (!fileInput.files.length) {
+
+                    if (
+                        !fileInput.files.length
+                    ) {
+
                         status.textContent =
                             "Please select a KML or KMZ file.";
 
-                        status.className = "error";
+                        status.className =
+                            "error";
 
                         return;
+
                     }
+
 
                     const file =
                         fileInput.files[0];
@@ -1076,18 +1217,23 @@ async def catchment_upload_page():
                     const filename =
                         file.name.toLowerCase();
 
+
                     if (
                         !filename.endsWith(".kml")
                         &&
                         !filename.endsWith(".kmz")
                     ) {
+
                         status.textContent =
                             "Please upload a .kml or .kmz file.";
 
-                        status.className = "error";
+                        status.className =
+                            "error";
 
                         return;
+
                     }
+
 
                     const formData =
                         new FormData();
@@ -1097,11 +1243,13 @@ async def catchment_upload_page():
                         file
                     );
 
+
                     const resolution =
                         resolutionInput.value;
 
                     const maxSlope =
                         slopeInput.value;
+
 
                     button.disabled = true;
 
@@ -1109,32 +1257,45 @@ async def catchment_upload_page():
 
                     status.className = "";
 
+
                     const start =
                         Date.now();
 
+
+                    function updateProgress() {
+
+                        const elapsed =
+                            Math.floor(
+                                (
+                                    Date.now()
+                                    - start
+                                )
+                                / 1000
+                            );
+
+
+                        status.innerHTML =
+                            '<span class="spinner"></span>'
+                            +
+                            'Analyzing contour map... '
+                            +
+                            elapsed
+                            +
+                            ' seconds elapsed. '
+                            +
+                            'This may take a few minutes.';
+
+                    }
+
+
+                    updateProgress();
+
+
                     const timer =
                         setInterval(
-                            function() {
-
-                                const elapsed =
-                                    Math.floor(
-                                        (Date.now() - start)
-                                        / 1000
-                                    );
-
-                                status.innerHTML =
-                                    '<span class="spinner"></span>' +
-                                    'Analyzing contour map... ' +
-                                    elapsed +
-                                    ' seconds elapsed.';
-
-                            },
+                            updateProgress,
                             500
                         );
-
-                    status.innerHTML =
-                        '<span class="spinner"></span>' +
-                        'Uploading and analyzing contour map...';
 
 
                     try {
@@ -1142,174 +1303,284 @@ async def catchment_upload_page():
                         const response =
                             await fetch(
                                 "/api/findCatchment"
-                                + "?resolution_m="
-                                + encodeURIComponent(resolution)
-                                + "&max_slope_deg="
-                                + encodeURIComponent(maxSlope),
+                                +
+                                "?resolution_m="
+                                +
+                                encodeURIComponent(
+                                    resolution
+                                )
+                                +
+                                "&max_slope_deg="
+                                +
+                                encodeURIComponent(
+                                    maxSlope
+                                ),
                                 {
                                     method: "POST",
                                     body: formData
                                 }
                             );
 
+
                         const data =
                             await response.json();
 
-                        clearInterval(timer);
+
+                        clearInterval(
+                            timer
+                        );
+
 
                         if (!response.ok) {
+
                             throw new Error(
                                 data.detail
                                 ||
                                 "API request failed."
                             );
+
                         }
+
 
                         const totalSeconds =
                             (
-                                Date.now() - start
+                                Date.now()
+                                - start
                             ) / 1000;
 
 
                         const contourLines =
-                            data.input_file
-                            ?.contour_lines_parsed
+                            data
+                                .input_file
+                                ?.contour_lines_parsed
                             ?? "N/A";
+
 
                         const minElevation =
-                            data.terrain_summary
-                            ?.elevation_range_m
-                            ?.min
+                            data
+                                .terrain_summary
+                                ?.elevation_range_m
+                                ?.min
                             ?? "N/A";
+
 
                         const maxElevation =
-                            data.terrain_summary
-                            ?.elevation_range_m
-                            ?.max
+                            data
+                                .terrain_summary
+                                ?.elevation_range_m
+                                ?.max
                             ?? "N/A";
+
 
                         const meanSlope =
-                            data.terrain_summary
-                            ?.mean_slope_deg
+                            data
+                                .terrain_summary
+                                ?.mean_slope_deg
                             ?? "N/A";
+
 
                         const siteLat =
-                            data.recommended_pond_site
-                            ?.lat
+                            data
+                                .recommended_pond_site
+                                ?.lat
                             ?? "N/A";
+
 
                         const siteLon =
-                            data.recommended_pond_site
-                            ?.lon
+                            data
+                                .recommended_pond_site
+                                ?.lon
                             ?? "N/A";
+
 
                         const siteElevation =
-                            data.recommended_pond_site
-                            ?.elevation_m
+                            data
+                                .recommended_pond_site
+                                ?.elevation_m
                             ?? "N/A";
+
 
                         const areaHectares =
-                            data.catchment
-                            ?.area_hectares
+                            data
+                                .catchment
+                                ?.area_hectares
                             ?? "N/A";
 
+
                         const areaM2 =
-                            data.catchment
-                            ?.area_m2
+                            data
+                                .catchment
+                                ?.area_m2
                             ?? "N/A";
 
 
                         status.innerHTML =
-                            "Analysis completed successfully "
-                            + "in "
-                            + totalSeconds.toFixed(1)
-                            + " seconds.";
+                            "Analysis completed "
+                            +
+                            "successfully in "
+                            +
+                            totalSeconds.toFixed(1)
+                            +
+                            " seconds.";
 
-                        status.className = "success";
+
+                        status.className =
+                            "success";
 
 
                         result.innerHTML = `
 
-                            <h2>Analysis Results</h2>
+                            <h2>
+                                Analysis Results
+                            </h2>
 
                             <div class="results-grid">
 
-                                <div class="result-card">
-                                    <div class="result-title">
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Contour Lines
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${contourLines}
                                     </div>
+
                                 </div>
 
-                                <div class="result-card">
-                                    <div class="result-title">
+
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Elevation Range
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${minElevation}
                                         –
-                                        ${maxElevation} m
+                                        ${maxElevation}
+                                        m
                                     </div>
+
                                 </div>
 
-                                <div class="result-card">
-                                    <div class="result-title">
+
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Mean Slope
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${meanSlope}°
                                     </div>
+
                                 </div>
 
-                                <div class="result-card">
-                                    <div class="result-title">
+
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Catchment Area
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${areaHectares}
                                         ha
                                     </div>
+
                                 </div>
 
-                                <div class="result-card">
-                                    <div class="result-title">
+
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Catchment Area
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${areaM2}
                                         m²
                                     </div>
+
                                 </div>
 
-                                <div class="result-card">
-                                    <div class="result-title">
+
+                                <div
+                                    class="result-card"
+                                >
+
+                                    <div
+                                        class="result-title"
+                                    >
                                         Pond Site Elevation
                                     </div>
-                                    <div class="result-value">
+
+                                    <div
+                                        class="result-value"
+                                    >
                                         ${siteElevation}
                                         m
                                     </div>
+
                                 </div>
 
                             </div>
 
-                            <div class="result-card"
-                                 style="margin-top:15px;">
 
-                                <div class="result-title">
+                            <div
+                                class="result-card"
+                                style="margin-top:15px;"
+                            >
+
+                                <div
+                                    class="result-title"
+                                >
                                     Recommended Pond Site
                                 </div>
 
-                                <div class="result-value">
+                                <div
+                                    class="result-value"
+                                >
                                     ${siteLat},
                                     ${siteLon}
                                 </div>
 
                             </div>
 
+
                             <details>
+
                                 <summary>
                                     View Full API Response
                                 </summary>
@@ -1321,28 +1592,40 @@ async def catchment_upload_page():
                                 )}</pre>
 
                             </details>
+
                         `;
 
-                    } catch (error) {
+                    }
 
-                        clearInterval(timer);
+                    catch (error) {
+
+                        clearInterval(
+                            timer
+                        );
 
                         status.textContent =
                             "Analysis failed: "
-                            + error.message;
+                            +
+                            error.message;
 
-                        status.className = "error";
+                        status.className =
+                            "error";
 
-                    } finally {
+                    }
 
-                        button.disabled = false;
+                    finally {
+
+                        button.disabled =
+                            false;
 
                     }
 
                 }
             );
+
         </script>
 
     </body>
+
     </html>
     """
