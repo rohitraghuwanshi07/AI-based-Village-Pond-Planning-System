@@ -28,11 +28,19 @@ def load_dem(path):
     return elevation, transform, crs
 
 
-def _pixel_size_in_meters(transform, elevation_shape):
+def pixel_size_meters(transform, elevation_shape):
     """
     Convert the DEM's pixel size (in degrees, since SRTM is in EPSG:4326)
     to approximate meters, using the mean latitude of the raster for the
-    longitude-to-meters conversion (longitude degrees shrink toward the poles).
+    longitude-to-meters conversion (longitude degrees shrink toward the poles
+    by a factor of cos(latitude) -- 1 degree of longitude is ~111.3km at the
+    equator but only ~78.8km at 45 degrees north/south, ~103.9km at 21
+    degrees. Using a flat 111,320 m/degree for BOTH axes -- as several call
+    sites in this codebase used to do -- overstates east-west cell width
+    (and therefore cell area, catchment area, and runoff volume) by
+    1/cos(latitude); e.g. ~7% too large at 21°N, ~19% too large at 45°N.
+    This is the single shared source of truth for that conversion so it
+    can't drift out of sync between callers again.
     """
     px_deg = abs(transform.a)  # pixel width in degrees longitude
     py_deg = abs(transform.e)  # pixel height in degrees latitude
@@ -48,6 +56,11 @@ def _pixel_size_in_meters(transform, elevation_shape):
     px_m = px_deg * meters_per_deg_lon
     py_m = py_deg * meters_per_deg_lat
     return px_m, py_m
+
+
+# Backward-compatible alias -- kept in case anything still imports the old
+# private name directly.
+_pixel_size_in_meters = pixel_size_meters
 
 
 def compute_slope_degrees(elevation: np.ndarray, transform) -> np.ndarray:

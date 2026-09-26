@@ -30,7 +30,7 @@ import numpy as np
 from affine import Affine
 from rasterio.features import rasterize
 from scipy import ndimage
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon as ShapelyPolygon
 from skimage import measure
 
 ROAD_BUFFER_M = 6.0  # approximate half-width + shoulder margin for a typical rural road
@@ -44,6 +44,54 @@ def _meters_to_deg(lat: float):
     lon_deg_per_m = 1.0 / (111_320.0 * math.cos(math.radians(lat)))
     lat_deg_per_m = 1.0 / 111_320.0
     return lon_deg_per_m, lat_deg_per_m
+
+
+def _mask_to_smoothed_polygons(mask: np.ndarray, transform: Affine, smoothing_cells: float = 1.5) -> list:
+    """
+    Trace the boundary of a boolean raster mask into clean polygon ring(s),
+    in [lon, lat] coordinates.
+
+    skimage.measure.find_contours traces the RAW pixel edge of a rasterized
+    mask, which comes out as a jagged, staircase-shaped outline (very
+    visible -- and ugly -- once drawn on a map, e.g. the "available land"
+    footprint shown for each ranked pond site). We clean that up with a
+    standard morphological open+close (buffer the polygon out, then back in
+    by the same amount): this rounds convex staircase corners and fills in
+    single-cell concave notches, without materially changing the patch's
+    real size, position, or shape. A light `.simplify()` afterward removes
+    the now-redundant extra vertices left behind by the buffering. The
+    smoothing distance is expressed in grid cells (smoothing_cells) so it
+    scales automatically with whatever resolution the caller rasterized at,
+    and stays small enough that it can't paper over genuinely small patches
+    or merge features that were actually separate.
+    """
+    px_deg = abs(transform.a)
+    py_deg = abs(transform.e)
+    smooth_deg = smoothing_cells * (px_deg + py_deg) / 2.0
+
+    boundary_paths = measure.find_contours(mask.astype(float), level=0.5)
+    polygons = []
+    for path in boundary_paths:
+        coords = [transform * (c, r) for r, c in path]
+        if len(coords) < 4:
+            continue
+        try:
+            poly = ShapelyPolygon(coords)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            smoothed = poly.buffer(smooth_deg, join_style=1).buffer(-smooth_deg, join_style=1)
+            simplified = smoothed.simplify(smooth_deg * 0.4, preserve_topology=True)
+            parts = list(simplified.geoms) if simplified.geom_type == "MultiPolygon" else [simplified]
+            for part in parts:
+                if part.is_empty or part.exterior is None:
+                    continue
+                polygons.append([[lon_, lat_] for lon_, lat_ in part.exterior.coords])
+        except Exception:
+            # Smoothing is a cosmetic best-effort step -- if it ever fails on
+            # a pathological shape, fall back to the raw (jagged but correct)
+            # boundary rather than dropping the patch entirely.
+            polygons.append([[lon_, lat_] for lon_, lat_ in coords])
+    return polygons
 
 
 def find_vacant_patches(
@@ -146,12 +194,7 @@ def find_vacant_patches(
         centroid_row, centroid_col = rows_idx.mean(), cols_idx.mean()
         centroid_lon, centroid_lat = transform * (centroid_col, centroid_row)
 
-        boundary_paths = measure.find_contours(patch_mask.astype(float), level=0.5)
-        polygons = []
-        for path in boundary_paths:
-            coords = [transform * (c, r) for r, c in path]
-            if len(coords) >= 4:
-                polygons.append([[lon_, lat_] for lon_, lat_ in coords])
+        polygons = _mask_to_smoothed_polygons(patch_mask, transform)
 
         patches.append({
             "label_id": int(label_id),
@@ -197,13 +240,8 @@ def find_vacant_patches(
 
 
 def _polygon_boundaries_from_mask(mask: np.ndarray, transform: Affine) -> dict:
-    """Trace boundary polygons for all True regions in a boolean mask, as GeoJSON."""
-    boundary_paths = measure.find_contours(mask.astype(float), level=0.5)
-    polygons = []
-    for path in boundary_paths:
-        coords = [transform * (c, r) for r, c in path]
-        if len(coords) >= 4:
-            polygons.append([[lon_, lat_] for lon_, lat_ in coords])
+    """Trace and smooth boundary polygons for all True regions in a boolean mask, as GeoJSON."""
+    polygons = _mask_to_smoothed_polygons(mask, transform)
     return {
         "type": "FeatureCollection",
         "features": [

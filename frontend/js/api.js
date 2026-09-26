@@ -1,6 +1,6 @@
 // Small wrapper around our FastAPI backend.
 // Change this if your backend runs on a different host/port.
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "";
 
 async function searchVillage(name) {
   const url = `${API_BASE}/api/village/search?q=${encodeURIComponent(name)}`;
@@ -77,6 +77,27 @@ async function suggestPondSite(south, north, west, east, options = {}) {
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
     throw new Error(body.detail || `Site suggestion failed (${resp.status})`);
+  }
+  return resp.json();
+}
+
+async function suggestTopPondSites(south, north, west, east, options = {}) {
+  const params = new URLSearchParams({
+    south, north, west, east,
+    land_cover: options.landCover || "cultivated_land",
+    target_capture_fraction: options.targetFraction || 0.5,
+  });
+  if (options.siteAreaM2 !== undefined && options.siteAreaM2 !== null && options.siteAreaM2 !== "") {
+    params.set("available_site_area_m2", options.siteAreaM2);
+  }
+  if (options.boundaryPolygon) {
+    params.set("boundary_polygon", options.boundaryPolygon);
+  }
+  const url = `${API_BASE}/api/pond/suggest-top-sites?${params.toString()}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.detail || `Top sites suggestion failed (${resp.status})`);
   }
   return resp.json();
 }

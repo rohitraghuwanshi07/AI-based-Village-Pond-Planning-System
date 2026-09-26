@@ -33,6 +33,8 @@ def _classify_seepage_risk(sand_pct: float, clay_pct: float) -> str:
     return "moderate"
 
 
+_SOIL_CACHE = {}
+
 async def fetch_soil_composition(lat: float, lon: float) -> dict:
     """
     Query SoilGrids for sand/silt/clay percentage at 0-5cm depth (topsoil,
@@ -43,6 +45,10 @@ async def fetch_soil_composition(lat: float, lon: float) -> dict:
     handling (same pattern as our other external-API clients in this
     project) -- never silently pretends to know soil data it doesn't have.
     """
+    cache_key = f"{round(lat, 4)}_{round(lon, 4)}"
+    if cache_key in _SOIL_CACHE:
+        return _SOIL_CACHE[cache_key]
+
     params = {
         "lon": lon,
         "lat": lat,
@@ -81,7 +87,7 @@ async def fetch_soil_composition(lat: float, lon: float) -> dict:
     clay = values.get("clay")
     seepage_risk = _classify_seepage_risk(sand, clay) if sand is not None and clay is not None else "unknown"
 
-    return {
+    result = {
         "query_succeeded": True,
         "sand_pct": sand,
         "silt_pct": values.get("silt"),
@@ -92,3 +98,6 @@ async def fetch_soil_composition(lat: float, lon: float) -> dict:
             "Treat as a screening indicator, not a substitute for an on-site soil test."
         ),
     }
+
+    _SOIL_CACHE[cache_key] = result
+    return result

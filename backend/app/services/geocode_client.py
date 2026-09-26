@@ -15,12 +15,34 @@ aggressive IP-based blocking we hit earlier in this project.
 """
 
 import httpx
+import json
+import hashlib
+from pathlib import Path
 
 PHOTON_URL = "https://photon.komoot.io/api/"
 OPENMETEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 HEADERS = {"User-Agent": "village-pond-planner-student-project"}
 
+# Cache directory for geocoding results
+CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "geocoding_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _get_cache(key: str) -> dict | None:
+    cache_file = CACHE_DIR / f"{key}.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except Exception:
+            return None
+    return None
+
+def _set_cache(key: str, data: dict):
+    cache_file = CACHE_DIR / f"{key}.json"
+    try:
+        cache_file.write_text(json.dumps(data))
+    except Exception:
+        pass
 
 async def _geocode_photon(query: str, country_code: str | None) -> dict | None:
     params = {"q": query, "limit": 5}
@@ -112,11 +134,24 @@ async def geocode_village(query: str, country_codes: str | None = "IN") -> dict 
     and return its location. Tries Photon first (better landmark coverage),
     falls back to Open-Meteo if Photon finds nothing or is unreachable.
     """
+    cache_key = hashlib.md5(f"{query}_{country_codes}".encode()).hexdigest()
+    cached = _get_cache(cache_key)
+    if cached:
+        return cached
+
+    result = None
     try:
         result = await _geocode_photon(query, country_codes)
-        if result:
-            return result
     except Exception:
         pass  # fall through to backup geocoder
 
-    return await _geocode_openmeteo(query, country_codes)
+    if not result:
+        try:
+            result = await _geocode_openmeteo(query, country_codes)
+        except Exception:
+            pass
+
+    if result:
+        _set_cache(cache_key, result)
+    
+    return result

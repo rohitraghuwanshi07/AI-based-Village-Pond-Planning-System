@@ -2,19 +2,54 @@
 // Default view: zoomed out to show all of India, so you can click anywhere
 // without needing to search a village first.
 const map = L.map("map").setView([22.9734, 78.6569], 5);
+// Ensure Leaflet knows the container size after CSS loads
+setTimeout(() => map.invalidateSize(), 500);
 
-// Street layer (free, OpenStreetMap tiles)
-const streetLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  attribution: "&copy; OpenStreetMap contributors",
-  maxZoom: 19,
-});
+// Default view: zoomed out to show all of India, so you can click anywhere
+// without needing to search a village first.
 
-// Satellite layer (free, Esri World Imagery tiles, no API key required)
+// Street layer.
+// NOT served from tile.openstreetmap.org. That server's own tile usage
+// policy (operations.osmfoundation.org/policies/tiles/) explicitly states:
+// "Heavy use (e.g. distributing an app that uses tiles from
+// openstreetmap.org) is forbidden without prior permission" -- which is
+// exactly what this app does once it's shared with more than one person.
+// OSMF enforces that by silently rate-limiting or blocking the offending
+// app's requests (a 403 "Referer is required", or just dropped/throttled
+// tiles) with NO error surfaced to the app, which is precisely what
+// "the map is sometimes fully blank/grey, sometimes has white patches"
+// looks like: full block = every tile fails = grey; partial
+// throttling = only some tiles fail = white patches where they should be.
+// It's not a bug in this code, it's this code hitting a server it was
+// never allowed to hit at app-distribution volume.
+//
+// Esri's World_Street_Map is used instead: same free, no-API-key,
+// no-signup ArcGIS REST tile service this app already relies on for the
+// satellite layer below (so it's already proven to work reliably here),
+// and Esri's terms permit exactly this kind of embedded, no-key use.
+const streetLayer = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+  {
+    attribution: "Tiles &copy; Esri &mdash; Source: Esri, HERE, Garmin, OpenStreetMap contributors",
+    maxZoom: 19,
+    maxNativeZoom: 19,
+  }
+);
+
+// Satellite layer (free, Esri World Imagery tiles, no API key required).
+// maxNativeZoom is set below maxZoom on purpose: Esri's free imagery has
+// genuinely no high-resolution coverage at all for a lot of rural areas
+// (exactly where this app is used) -- requesting tiles past whatever zoom
+// IS actually available for a given spot returns blank/white tiles, which
+// looks like a bug but is a real data gap in the free tileset. Capping
+// maxNativeZoom makes Leaflet re-use (and upscale) the best real imagery it
+// has instead of requesting tiles that don't exist for that location.
 const satelliteLayer = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
   {
     attribution: "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics",
     maxZoom: 19,
+    maxNativeZoom: 17,
   }
 );
 
@@ -80,7 +115,10 @@ async function handleSearch() {
     searchStatus.textContent = `Found: ${result.name}`;
     lastVillageBbox = result.bbox;
     document.getElementById("contours-btn").disabled = false;
-    document.getElementById("suggest-site-btn").disabled = false;
+    document.getElementById("suggest-top-btn").disabled = false;
+    
+    // Clear any previous selection when searching new village
+    cancelBoundarySelection();
   } catch (err) {
     searchStatus.textContent = err.message;
     searchStatus.classList.add("error");
@@ -92,18 +130,193 @@ searchInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") handleSearch();
 });
 
-// ---- Click-to-select a candidate pond site ----
+// ---- Boundary Selection Logic (4 Corners) ----
 const resultsPanel = document.getElementById("results-panel");
 const resultsContent = document.getElementById("results-content");
+const selectBoundaryBtn = document.getElementById("select-boundary-btn");
+const selectionHint = document.getElementById("selection-hint");
+
+// #map is a flex sibling of #results-panel (flex: 1, so it fills whatever
+// width is left over) -- opening the results panel for the first time
+// changes #results-panel from display:none to visible, which shrinks #map's
+// actual on-screen width. Leaflet caches the pixel size of its container at
+// init time and has NO way to know the DOM just resized around it unless
+// told explicitly, so every "show the results panel" call used to leave
+// Leaflet's internal tile grid sized for the OLD (usually wider) container --
+// which is exactly what produces random blank/white gaps where it thinks
+// tiles already cover the area but the actual visible map doesn't, along
+// with panning/zooming looking subtly "glitched" relative to reality. This
+// helper is the single place that opens the panel, so the fix (recalculating
+// right after) can't be missed by a future call site the way the 4 separate
+// `resultsPanel.classList.remove("hidden")` calls it replaces could be.
+function showResultsPanel() {
+  resultsPanel.classList.remove("hidden");
+  // setTimeout(0) queues this for right after the browser finishes the
+  // layout reflow the classList change just triggered -- calling
+  // invalidateSize() synchronously would still see the OLD size.
+  setTimeout(() => map.invalidateSize(), 0);
+}
+
+let isSelectingBoundary = false;
+let boundaryCorners = [];
+let cornerMarkers = [];
+let boundaryPolygon = null;
+let lastRankedSites = null;  // cached ranked-sites list, so "View Full Analysis" can return to it without re-running the search
+
+// Monotonically-increasing token identifying the "current" in-flight result
+// render. There are 3 independent places that can update the results
+// panel/map (whole-village "Suggest Top 3", boundary-based "Select 4
+// Corners", and single-site "View Full Analysis") -- each is an async
+// fetch, so if you start one and then start ANOTHER before the first
+// finishes, whichever network response happened to arrive LAST used to win
+// and overwrite the screen, regardless of which action you'd actually
+// moved on to. That's what caused "I started drawing a boundary and it
+// snapped back to the old top-3 results" -- a stale, already-abandoned
+// fetch finishing late and clobbering the newer flow's state. Every flow
+// below grabs a fresh token before it starts and checks it's still current
+// before touching the DOM; a flow whose token has been superseded quietly
+// discards its result instead of rendering it.
+let currentRequestId = 0;
+
+selectBoundaryBtn.addEventListener("click", () => {
+  isSelectingBoundary = !isSelectingBoundary;
+  if (isSelectingBoundary) {
+    startBoundarySelection();
+  } else {
+    cancelBoundarySelection();
+  }
+});
+
+function startBoundarySelection() {
+  cancelBoundarySelection(); // Clear any previous selection
+  currentRequestId++;  // invalidate any in-flight "Suggest Top 3" (whole-village) fetch immediately
+  isSelectingBoundary = true;
+  selectBoundaryBtn.textContent = "Cancel Selection";
+  selectBoundaryBtn.classList.add("selecting");
+  selectionHint.textContent = "Click corner #1 on the map...";
+  map.getContainer().style.cursor = "crosshair";
+}
+
+function cancelBoundarySelection() {
+  isSelectingBoundary = false;
+  boundaryCorners = [];
+  cornerMarkers.forEach(m => map.removeLayer(m));
+  cornerMarkers = [];
+  if (boundaryPolygon) map.removeLayer(boundaryPolygon);
+  boundaryPolygon = null;
+  selectBoundaryBtn.textContent = "📍 Select Boundary (4 Corners)";
+  selectBoundaryBtn.classList.remove("selecting");
+  selectionHint.textContent = "Click the button above then select 4 corners on the map to define your search area.";
+  map.getContainer().style.cursor = "";
+}
+
+// Sort points by angle around their centroid, so any 4 clicks describing a
+// roughly convex quadrilateral -- regardless of the order they were clicked
+// in -- form a valid, simple (non-self-intersecting) polygon.
+function orderCornersByAngle(corners) {
+  const cLat = corners.reduce((s, c) => s + c[0], 0) / corners.length;
+  const cLng = corners.reduce((s, c) => s + c[1], 0) / corners.length;
+  return [...corners].sort((a, b) => {
+    const angleA = Math.atan2(a[0] - cLat, a[1] - cLng);
+    const angleB = Math.atan2(b[0] - cLat, b[1] - cLng);
+    return angleA - angleB;
+  });
+}
+
+map.on("click", async (e) => {
+  if (!isSelectingBoundary) return;
+
+  const { lat, lng } = e.latlng;
+  boundaryCorners.push([lat, lng]);
+
+  const marker = L.marker([lat, lng], {
+    icon: L.divIcon({ 
+      className: "corner-marker", 
+      html: boundaryCorners.length, 
+      iconSize: [20, 20],
+      iconAnchor: [10, 10],  // center the icon on the actual clicked point -- without this
+                             // Leaflet anchors at the icon's top-left corner, so the number
+                             // visibly drifts away from the real corner as you zoom
+    })
+  }).addTo(map);
+  cornerMarkers.push(marker);
+
+  if (boundaryCorners.length < 4) {
+    selectionHint.textContent = `Click corner #${boundaryCorners.length + 1} on the map...`;
+  } else {
+    // 4 corners selected!
+    isSelectingBoundary = false;
+    selectBoundaryBtn.classList.remove("selecting");
+    selectBoundaryBtn.textContent = "📍 Select Boundary (4 Corners)";
+    selectionHint.textContent = "Analyzing area...";
+    map.getContainer().style.cursor = "";
+
+    // Order the 4 clicked points around their centroid (by angle) before
+    // building a polygon from them. Without this, clicking corners in
+    // anything other than strict perimeter order (e.g. the two diagonals
+    // first, which is an easy, natural way to click "the 4 corners of an
+    // area") produces a self-intersecting "bowtie" polygon -- which has
+    // near-ZERO real area even though it looks roughly like the intended
+    // shape on screen. That degenerate shape is what actually got sent to
+    // the backend, so the ranked sites came back from almost none of the
+    // area the user thought they'd selected -- looking like wrong/random
+    // site placement. Sorting by angle guarantees a valid, simple polygon
+    // for any convex-ish quadrilateral, regardless of click order.
+    const orderedCorners = orderCornersByAngle(boundaryCorners);
+
+    // Draw the selection polygon (using the corrected order)
+    boundaryPolygon = L.polygon(orderedCorners, { color: "#d9534f", weight: 2, fillOpacity: 0.1 }).addTo(map);
+
+    // Calculate bbox for API
+    const lats = orderedCorners.map(c => c[0]);
+    const lngs = orderedCorners.map(c => c[1]);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+    const west = Math.min(...lngs);
+    const east = Math.max(...lngs);
+
+    const myRequestId = ++currentRequestId;  // claim this render slot -- see currentRequestId comment above
+
+    showResultsPanel();
+    resultsContent.innerHTML = `<p class="hint">Finding top 3 pond sites strictly within your boundary... (very fast)</p>`;
+    
+    // Clear existing result layers
+    if (siteMarker) map.removeLayer(siteMarker);
+    topSiteMarkers.forEach(m => map.removeLayer(m));
+    topSiteMarkers = [];
+    topSiteFootprints.forEach(l => map.removeLayer(l));
+    topSiteFootprints = [];
+    topSitePondFootprints.forEach(l => map.removeLayer(l));
+    topSitePondFootprints = [];
+    if (catchmentLayer) map.removeLayer(catchmentLayer);
+    [ownershipGovLayer, ownershipPrivateLayer, ownershipUnverifiedLayer, ownershipEligibleLayer].forEach(l => {
+      if (l) map.removeLayer(l);
+    });
+    if (vacantLandLayer) map.removeLayer(vacantLandLayer);
+    if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
+    document.getElementById("explain-panel").classList.add("hidden");
+
+    try {
+      // Format polygon for API: lon,lat;lon,lat...
+      // Close the polygon by repeating the first point
+      const polyStr = [...orderedCorners, orderedCorners[0]]
+        .map(c => `${c[1]},${c[0]}`)
+        .join(";");
+        
+      const rec = await suggestTopPondSites(south, north, west, east, { boundaryPolygon: polyStr });
+      if (myRequestId !== currentRequestId) return;  // a newer action started while this was in flight -- discard
+      renderTop5Sites(rec.ranked_sites);
+      selectionHint.textContent = "Selection complete. See results below.";
+    } catch (err) {
+      if (myRequestId !== currentRequestId) return;
+      resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
+      selectionHint.textContent = "Error during analysis.";
+    }
+  }
+});
 
 // Build an analysis bounding box CENTERED ON THE CLICKED POINT, not the
-// searched village. This is what makes the tool work anywhere -- India-wide,
-// or globally wherever SRTM elevation data exists -- instead of only within
-// a fixed radius of whatever village name was searched.
-//
-// Trade-off: a bigger box catches bigger watersheds but means a bigger DEM
-// download + slower catchment computation. 0.06 degrees (~13km box, ~6.5km
-// radius) is a reasonable default for small-to-medium village catchments.
+// searched village. 
 const ANALYSIS_HALF_SIZE_DEG = 0.06;
 
 function bboxAroundPoint(lat, lon, halfSize = ANALYSIS_HALF_SIZE_DEG) {
@@ -115,32 +328,72 @@ function bboxAroundPoint(lat, lon, halfSize = ANALYSIS_HALF_SIZE_DEG) {
   };
 }
 
-map.on("click", async (e) => {
-  const { lat, lng } = e.latlng;
-  await analyzeAndRender(lat, lng, /*isAutoSuggested=*/ false);
-});
-
 // Shared rendering used by both a manual map click and the auto "Suggest Best Site" button.
 async function analyzeAndRender(lat, lng, isAutoSuggested, autoSelectedInfo = null) {
   if (siteMarker) map.removeLayer(siteMarker);
+
+  // If this call is drilling into one specific ranked site (from a rank
+  // card's "View Full Analysis" button), keep the other ranked
+  // markers/footprints on the map and in memory -- clearing them here was
+  // exactly why picking rank #1 used to make ranks #2/#3 vanish, with no
+  // way back short of redrawing the whole boundary and re-running the
+  // search. Only a genuinely fresh single-point analysis (a plain map
+  // click, or "Suggest Best Site") should clear the ranked-site layers.
+  const viewingRankedSite = !!(autoSelectedInfo && autoSelectedInfo.rank && lastRankedSites);
+  if (!viewingRankedSite && typeof topSiteMarkers !== "undefined") {
+    topSiteMarkers.forEach(m => map.removeLayer(m));
+    topSiteMarkers = [];
+    topSiteFootprints.forEach(l => map.removeLayer(l));
+    topSiteFootprints = [];
+    topSitePondFootprints.forEach(l => map.removeLayer(l));
+    topSitePondFootprints = [];
+    lastRankedSites = null;
+  }
+
+  const myRequestId = ++currentRequestId;  // claim this render slot -- see currentRequestId comment above
+
   siteMarker = L.marker([lat, lng], {
-    icon: L.divIcon({ className: "site-marker", html: isAutoSuggested ? "⭐" : "📍", iconSize: [24, 24] }),
+    icon: L.divIcon({ className: "site-marker", html: isAutoSuggested ? "⭐" : "📍", iconSize: [24, 24], iconAnchor: [12, 12] }),
   }).addTo(map);
 
-  resultsPanel.classList.remove("hidden");
-  resultsContent.innerHTML = `<p class="hint">Analyzing catchment, rainfall, runoff, soil, and pond sizing... (this can take 15-40s)</p>`;
+  showResultsPanel();
+  const backButtonHtml = viewingRankedSite
+    ? `<button id="back-to-ranked-btn" class="layer-btn full-width" style="margin-bottom:12px;">&larr; Back to Top 3 Ranked Sites</button>`
+    : "";
+  resultsContent.innerHTML = `
+    ${backButtonHtml}
+    <div class="analysis-status">
+      <p class="hint">🚀 Running fast parallel analysis...</p>
+      <ul class="status-list">
+        <li>📡 Fetching terrain and delineating catchment...</li>
+        <li>🌧️ Analyzing historical rainfall (10 years)...</li>
+        <li>🌱 Checking soil composition and seepage risk...</li>
+        <li>🏢 Identifying buildings, roads, and land ownership...</li>
+        <li>📐 Sizing pond for optimal runoff capture...</li>
+      </ul>
+      <p class="hint" style="margin-top:10px;">Usually takes 5-15 seconds now.</p>
+    </div>
+  `;
+  if (viewingRankedSite) {
+    document.getElementById("back-to-ranked-btn").addEventListener("click", () => restoreRankedSitesView());
+  }
 
   try {
     const { south, north, west, east } = bboxAroundPoint(lat, lng);
     const siteAreaInput = document.getElementById("site-area-input").value;
     const rec = await getPondRecommendation(south, north, west, east, lat, lng, { siteAreaM2: siteAreaInput });
-    renderSiteSummary(rec, lat, lng, autoSelectedInfo);
+    if (myRequestId !== currentRequestId) return;  // a newer action started while this was in flight -- discard
+    renderSiteSummary(rec, lat, lng, autoSelectedInfo, viewingRankedSite);
   } catch (err) {
-    resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
+    if (myRequestId !== currentRequestId) return;
+    resultsContent.innerHTML = `${backButtonHtml}<p class="status-text error">${err.message}</p>`;
+    if (viewingRankedSite) {
+      document.getElementById("back-to-ranked-btn").addEventListener("click", () => restoreRankedSitesView());
+    }
   }
 }
 
-function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
+function renderSiteSummary(rec, lat, lng, autoSelectedInfo, viewingRankedSite = false) {
   if (catchmentLayer) map.removeLayer(catchmentLayer);
   if (rec.catchment && rec.catchment.boundary_geojson) {
     catchmentLayer = L.geoJSON(rec.catchment.boundary_geojson, {
@@ -221,13 +474,13 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
   }
 
   const sufficiencyNote = p.cannot_recommend
-    ? `<span style="color:#b3413a;">✗ ${p.reason}</span>`
+    ? `<span style="color:${p.data_unavailable ? '#8a6d1a' : '#b3413a'};">${p.data_unavailable ? '⚠' : '✗'} ${p.reason}</span>`
     : p.site_area_sufficient_for_target
-    ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction*100).toFixed(0)}% capture target</span>`
-    : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
+      ? `<span style="color:#2c5a3d;">✓ Site is large enough for the ${(p.target_capture_fraction * 100).toFixed(0)}% capture target</span>`
+      : `<span style="color:#b3413a;">⚠ Site can only capture ${p.percent_of_annual_runoff_captured}% of target — consider a larger site or a second pond</span>`;
 
   const catchmentClippedNote = rec.catchment && rec.catchment.area_hectares > (2 * ANALYSIS_HALF_SIZE_DEG * 111) * (2 * ANALYSIS_HALF_SIZE_DEG * 111) * 0.9
-    ? `<p class="hint" style="color:#b3841a;">Note: this catchment may extend beyond our ${(ANALYSIS_HALF_SIZE_DEG*2*111).toFixed(0)}km analysis window and could be larger than shown.</p>`
+    ? `<p class="hint" style="color:#b3841a;">Note: this catchment may extend beyond our ${(ANALYSIS_HALF_SIZE_DEG * 2 * 111).toFixed(0)}km analysis window and could be larger than shown.</p>`
     : "";
 
   const sc = rec.site_check;
@@ -253,12 +506,53 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ? `<div class="result-row"><span class="label">Soil (sand/silt/clay)</span><span class="value">${soil.sand_pct}% / ${soil.silt_pct}% / ${soil.clay_pct}%</span></div>
        <div class="result-row"><span class="label">Seepage risk</span><span class="value">${soil.seepage_risk}</span></div>`
     : soil
-    ? `<p class="hint" style="color:#b3413a;">⚠ ${soil.note}</p>`
+      ? `<p class="hint" style="color:#b3413a;">⚠ ${soil.note}</p>`
+      : "";
+
+  // Same "why this ranking" explanation and obstacle breakdown shown on the
+  // ranked-list cards (renderTop5Sites), rendered here too -- this used to
+  // just show a bare one-line "Score: X/100" summary, which is a visible
+  // downgrade from the rich card someone just clicked "View Full Analysis"
+  // from. rec.manual_score_info is now populated for BOTH a fresh manual
+  // click and a ranked site's detail view (see _full_recommendation).
+  const msi = rec.manual_score_info;
+  const badgeHtml = autoSelectedInfo && autoSelectedInfo.rank
+    ? `<div class="rank-badge" style="display:inline-block; margin-bottom:10px;">Rank #${autoSelectedInfo.rank} Site</div>`
+    : autoSelectedInfo
+      ? "" // auto-suggested-lowest-elevation path has its own note below
+      : `<div class="rank-badge" style="display:inline-block; margin-bottom:10px; background-color: #6b7a70;">Manual Selection</div>`;
+
+  const msiObs = msi ? (msi.nearby_obstacles || {}) : {};
+  const msiDataUnavailable = !!msiObs.data_unavailable;
+  const msiHasObs = (msiObs.buildings_nearby || msiObs.roads_nearby || msiObs.water_bodies_nearby);
+  const msiObsText = msiDataUnavailable
+    ? `<span style="color:#8a6d1a">Obstacle data unavailable (query failed) — not verified</span>`
+    : msiHasObs
+      ? `<span style="color:#b3413a">Bldgs: ${msiObs.buildings_nearby || 0}, Rds: ${msiObs.roads_nearby || 0}, Water: ${msiObs.water_bodies_nearby || 0}</span>`
+      : `<span style="color:#2c5a3d">Clear of obstacles</span>`;
+
+  // Same real-zero-vs-unavailable distinction as the ranked cards: available
+  // area of exactly 0 is a real, meaningful result and must say "0 m²", not
+  // be confused with "not checked yet".
+  const siteAvailableArea = sc && sc.available_area_m2 !== undefined ? sc.available_area_m2 : null;
+  const areaDisplayRow = msi
+    ? `<div class="result-row"><span class="label">Available Area</span><span class="value">${
+        msiDataUnavailable
+          ? "Not verified (query failed)"
+          : (siteAvailableArea !== null ? siteAvailableArea.toLocaleString() + ' m²' : 'Unknown')
+      }</span></div>`
     : "";
 
-  const autoNote = autoSelectedInfo
-    ? `<p class="hint" style="color:#2c5a3d;">⭐ Auto-suggested lowest-elevation site (elevation ${autoSelectedInfo.elevation_at_site_m}m, lower than ${autoSelectedInfo.elevation_percentile_among_candidates}% of nearby candidates).</p>`
+  const explanationHtml = msi
+    ? `${badgeHtml}
+       <div class="rank-explanation">${msi.explanation}</div>
+       ${areaDisplayRow}
+       <div class="result-row"><span class="label">Obstacles</span><span class="value" style="font-size:0.8rem">${msiObsText}</span></div>`
     : "";
+
+  const autoNote = autoSelectedInfo && !autoSelectedInfo.rank
+    ? `<p class="hint" style="color:#2c5a3d;">⭐ Auto-suggested lowest-elevation site (elevation ${autoSelectedInfo.elevation_at_site_m}m, lower than ${autoSelectedInfo.elevation_percentile_among_candidates}% of nearby candidates).</p>${explanationHtml}`
+    : explanationHtml;
 
   const depthDisplay = p.recommended_depth_m !== null && p.recommended_depth_m !== undefined ? `${p.recommended_depth_m} m` : "—";
   const areaDisplay = p.recommended_surface_area_m2 !== null && p.recommended_surface_area_m2 !== undefined ? `${p.recommended_surface_area_m2.toLocaleString()} m²` : "—";
@@ -275,7 +569,12 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
        <div class="result-row"><span class="label">Avg annual runoff</span><span class="value">${rec.runoff.avg_annual_runoff_volume_m3.toLocaleString()} m³</span></div>`
     : "";
 
+  const backButtonHtml = viewingRankedSite
+    ? `<button id="back-to-ranked-btn" class="layer-btn full-width" style="margin-bottom:12px;">&larr; Back to Top 3 Ranked Sites</button>`
+    : "";
+
   resultsContent.innerHTML = `
+    ${backButtonHtml}
     ${autoNote}
     ${lat !== null ? `<div class="result-row"><span class="label">Location</span><span class="value">${lat.toFixed(4)}, ${lng.toFixed(4)}</span></div>` : ""}
     ${rainfallRow}
@@ -290,8 +589,31 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo) {
     ${siteCheckNote}
     ${catchmentClippedNote}
   `;
+  if (viewingRankedSite) {
+    document.getElementById("back-to-ranked-btn").addEventListener("click", () => restoreRankedSitesView());
+  }
 
   renderExplanationPanel(rec);
+}
+
+// Returns to the previously-fetched top-3 ranked sites view WITHOUT
+// re-running the search: clears the layers specific to the single-site
+// detail view (catchment outline, ownership layers, pond footprint for that
+// one site, the pin marker), then just re-renders the ranked sites list and
+// markers that were kept on the map/in memory all along.
+function restoreRankedSitesView() {
+  if (!lastRankedSites) return;
+  currentRequestId++;  // invalidate any in-flight fetch from the site detail view we're leaving
+  if (siteMarker) { map.removeLayer(siteMarker); siteMarker = null; }
+  if (catchmentLayer) { map.removeLayer(catchmentLayer); catchmentLayer = null; }
+  if (vacantLandLayer) { map.removeLayer(vacantLandLayer); vacantLandLayer = null; }
+  if (pondFootprintLayer) { map.removeLayer(pondFootprintLayer); pondFootprintLayer = null; }
+  [ownershipGovLayer, ownershipPrivateLayer, ownershipUnverifiedLayer, ownershipEligibleLayer].forEach(l => {
+    if (l) map.removeLayer(l);
+  });
+  ownershipGovLayer = ownershipPrivateLayer = ownershipUnverifiedLayer = ownershipEligibleLayer = null;
+  document.getElementById("explain-panel").classList.add("hidden");
+  renderTop5Sites(lastRankedSites);
 }
 
 // Builds the plain-language "Why this result?" panel on the right, explaining
@@ -305,6 +627,16 @@ function renderExplanationPanel(rec) {
   const p = rec.pond_recommendation || {};
 
   let html = "";
+
+  if (rec.manual_score_info) {
+    html += `
+      <div class="explain-block">
+        <h3>Site Scoring</h3>
+        <p>${rec.manual_score_info.explanation}</p>
+      </div>
+    `;
+  }
+
 
   // Block 1: catchment context, if available
   if (rec.catchment) {
@@ -324,8 +656,8 @@ function renderExplanationPanel(rec) {
       <div class="explain-block">
         <h3>Why the eligible area is limited</h3>
         <p>${isLandRecord
-          ? "Your uploaded land record was checked parcel-by-parcel. Only parcels explicitly classified as government/public land count as eligible — everything else is subtracted below."
-          : "OpenStreetMap data was checked for real buildings, roads, water bodies, and land tagged as government/public. Only land meeting ALL of these is eligible — everything else is subtracted below."}</p>
+        ? "Your uploaded land record was checked parcel-by-parcel. Only parcels explicitly classified as government/public land count as eligible — everything else is subtracted below."
+        : "OpenStreetMap data was checked for real buildings, roads, water bodies, and land tagged as government/public. Only land meeting ALL of these is eligible — everything else is subtracted below."}</p>
         <div class="explain-stat-row"><span>Government-owned land found</span><span class="val">${b.government_owned_area_m2.toLocaleString()} m²</span></div>
         <div class="explain-stat-row subtract"><span>Occupied by buildings/roads/water</span><span class="val">${b.government_area_occupied_by_development_m2.toLocaleString()} m²</span></div>
         <div class="explain-stat-row total"><span>Final eligible land</span><span class="val">${b.final_eligible_vacant_government_area_m2.toLocaleString()} m²</span></div>
@@ -368,7 +700,7 @@ function renderExplanationPanel(rec) {
       <div class="explain-block">
         <h3>What this means for the pond</h3>
         <p>With <strong>${(sc && sc.available_area_m2 !== undefined ? sc.available_area_m2 : sc && sc.area_breakdown ? sc.area_breakdown.final_eligible_vacant_government_area_m2 : "the available").toLocaleString()} m²</strong> of usable land, the largest practical pond here is <strong>${p.recommended_surface_area_m2.toLocaleString()} m²</strong> at <strong>${p.recommended_depth_m}m</strong> deep — capturing about <strong>${capturedPct}%</strong> of this site's annual runoff.</p>
-        ${!p.site_area_sufficient_for_target ? `<p style="color:#b3413a;">This falls short of the ${(p.target_capture_fraction*100).toFixed(0)}% target because the catchment is large relative to the available land. A larger site, or a second pond elsewhere in the catchment, would capture more.</p>` : ""}
+        ${!p.site_area_sufficient_for_target ? `<p style="color:#b3413a;">This falls short of the ${(p.target_capture_fraction * 100).toFixed(0)}% target because the catchment is large relative to the available land. A larger site, or a second pond elsewhere in the catchment, would capture more.</p>` : ""}
       </div>
     `;
   } else if (p.cannot_recommend) {
@@ -384,35 +716,183 @@ function renderExplanationPanel(rec) {
   panel.classList.remove("hidden");
 }
 
-// ---- Auto-suggest the best (lowest-elevation) pond site within the searched village ----
-document.getElementById("suggest-site-btn").addEventListener("click", async () => {
+
+
+let topSiteMarkers = [];
+let topSiteFootprints = [];
+let topSitePondFootprints = [];
+
+// ---- Auto-suggest top 5 pond sites ----
+document.getElementById("suggest-top-btn").addEventListener("click", async () => {
   if (!lastVillageBbox) return;
-  const btn = document.getElementById("suggest-site-btn");
+  const btn = document.getElementById("suggest-top-btn");
   const originalText = btn.textContent;
-  btn.textContent = "Finding best site...";
+  btn.textContent = "Finding top 3 sites...";
   btn.disabled = true;
 
-  resultsPanel.classList.remove("hidden");
-  resultsContent.innerHTML = `<p class="hint">Fetching elevation data and finding the lowest-elevation drainage point... (this can take 20-50s)</p>`;
+  const myRequestId = ++currentRequestId;  // claim this render slot -- see currentRequestId comment above
+
+  showResultsPanel();
+  resultsContent.innerHTML = `<p class="hint">Fetching elevation data and ranking best candidate sites... (this can take 10-20s)</p>`;
+
+  // clear existing layers
+  if (siteMarker) map.removeLayer(siteMarker);
+  topSiteMarkers.forEach(m => map.removeLayer(m));
+  topSiteMarkers = [];
+  topSiteFootprints.forEach(l => map.removeLayer(l));
+  topSiteFootprints = [];
+  topSitePondFootprints.forEach(l => map.removeLayer(l));
+  topSitePondFootprints = [];
+
+  if (catchmentLayer) map.removeLayer(catchmentLayer);
+  [ownershipGovLayer, ownershipPrivateLayer, ownershipUnverifiedLayer, ownershipEligibleLayer].forEach(l => {
+    if (l) map.removeLayer(l);
+  });
+  if (vacantLandLayer) map.removeLayer(vacantLandLayer);
+  if (pondFootprintLayer) map.removeLayer(pondFootprintLayer);
+
+  document.getElementById("explain-panel").classList.add("hidden");
 
   try {
     const { south, north, west, east } = lastVillageBbox;
     const siteAreaInput = document.getElementById("site-area-input").value;
-    const rec = await suggestPondSite(south, north, west, east, { siteAreaM2: siteAreaInput });
-    const { lat, lon } = rec.location;
-    if (siteMarker) map.removeLayer(siteMarker);
-    siteMarker = L.marker([lat, lon], {
-      icon: L.divIcon({ className: "site-marker", html: "⭐", iconSize: [24, 24] }),
-    }).addTo(map);
-    map.setView([lat, lon], 14);
-    renderSiteSummary(rec, lat, lon, rec.auto_selected);
+    const rec = await suggestTopPondSites(south, north, west, east, { siteAreaM2: siteAreaInput });
+
+    if (myRequestId !== currentRequestId) return;  // a newer action (e.g. starting a boundary selection) started while this was in flight -- discard
+    renderTop5Sites(rec.ranked_sites);
   } catch (err) {
+    if (myRequestId !== currentRequestId) return;
     resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
   } finally {
     btn.textContent = originalText;
     btn.disabled = false;
   }
 });
+
+function renderTop5Sites(sites) {
+  let html = "";
+
+  if (!sites || sites.length === 0) {
+    resultsContent.innerHTML = `<p class="status-text error">No suitable sites found.</p>`;
+    return;
+  }
+
+  lastRankedSites = sites;  // cache so "View Full Analysis" can return here without re-fetching
+
+  const coords = sites.map(s => [s.location.lat, s.location.lon]);
+
+  const RANK_MARKER_COLORS = { 1: "#d4af37", 2: "#9aa0a6", 3: "#b08d57" }; // gold / silver / bronze
+  const WELL_EMOJI = "💧";
+
+  sites.forEach((site) => {
+    const { lat, lon } = site.location;
+
+    const markerColor = RANK_MARKER_COLORS[site.rank] || "#2c5a3d";
+    const iconHtml = `
+      <div class="rank-marker" style="background:${markerColor}">
+        <span class="rank-marker-emoji">${WELL_EMOJI}</span>
+        <span class="rank-marker-num">${site.rank}</span>
+      </div>`;
+    const marker = L.marker([lat, lon], {
+      icon: L.divIcon({ className: "site-marker rank-icon", html: iconHtml, iconSize: [30, 30], iconAnchor: [15, 15] }),
+    }).addTo(map);
+
+    marker.bindTooltip(`Rank #${site.rank} (Score: ${site.composite_score})`, { className: "pond-tooltip", sticky: true });
+    topSiteMarkers.push(marker);
+
+    if (site.vacant_land_boundary_geojson) {
+      const footprint = L.geoJSON(site.vacant_land_boundary_geojson, {
+        style: { color: "#8a5a2b", weight: 2, fillColor: "#e8d5a8", fillOpacity: 0.35, dashArray: "6,4" },
+      }).addTo(map)
+        .bindTooltip(`Rank #${site.rank}: available land (${(site.available_area_m2 !== undefined && site.available_area_m2 !== null) ? site.available_area_m2.toLocaleString() + ' m²' : 'unknown'})`, { className: "pond-tooltip", sticky: true });
+      topSiteFootprints.push(footprint);
+    }
+
+    // The actual recommended POND size for this site (a sub-boundary inside
+    // the available-land patch above), sized from this site's own catchment
+    // -- not just how much land happens to be free -- so it's clear how big
+    // the pond itself should actually be here.
+    const sizing = site.pond_sizing;
+    if (sizing && sizing.recommended_surface_area_m2) {
+      const sideMeters = Math.sqrt(sizing.recommended_surface_area_m2);
+      const halfSideDegLat = (sideMeters / 2) / 111320;
+      const halfSideDegLon = (sideMeters / 2) / (111320 * Math.cos(lat * Math.PI / 180));
+      const pondColor = RANK_MARKER_COLORS[site.rank] || "#d9534f";
+      const pondFootprint = L.rectangle(
+        [[lat - halfSideDegLat, lon - halfSideDegLon], [lat + halfSideDegLat, lon + halfSideDegLon]],
+        { color: pondColor, weight: 2, fillColor: pondColor, fillOpacity: 0.45 }
+      ).addTo(map)
+        .bindTooltip(
+          `Rank #${site.rank} pond: ${sideMeters.toFixed(0)}m × ${sideMeters.toFixed(0)}m, depth ${sizing.recommended_depth_m}m`,
+          { className: "pond-tooltip", sticky: true }
+        );
+      topSitePondFootprints.push(pondFootprint);
+    }
+
+    const obs = site.nearby_obstacles || {};
+    const dataUnavailable = !!obs.data_unavailable;
+    const hasObs = (obs.buildings_nearby || obs.roads_nearby || obs.water_bodies_nearby);
+    const obsText = dataUnavailable
+      ? `<span style="color:#8a6d1a">Obstacle data unavailable (query failed) — not verified</span>`
+      : hasObs
+        ? `<span style="color:#b3413a">Bldgs: ${obs.buildings_nearby || 0}, Rds: ${obs.roads_nearby || 0}, Water: ${obs.water_bodies_nearby || 0}</span>`
+        : `<span style="color:#2c5a3d">Clear of obstacles</span>`;
+
+    // available_area_m2 can legitimately BE 0 (site really is fully built up) --
+    // that's a real, meaningful number and must be shown as "0 m²", not
+    // treated the same as "we have no idea" just because 0 is falsy in JS.
+    // The only time this should say "Unknown"/"Not verified" is when the
+    // live obstruction query actually failed.
+    const areaText = dataUnavailable
+      ? "Not verified (query failed)"
+      : (site.available_area_m2 !== undefined && site.available_area_m2 !== null)
+        ? site.available_area_m2.toLocaleString() + ' m²'
+        : 'Unknown';
+
+    const sizingRow = (sizing && sizing.recommended_surface_area_m2)
+      ? `<div class="result-row"><span class="label">Recommended Pond</span><span class="value">${sizing.recommended_surface_dimensions_m || (Math.sqrt(sizing.recommended_surface_area_m2).toFixed(0) + 'm x ' + Math.sqrt(sizing.recommended_surface_area_m2).toFixed(0) + 'm')}, ${sizing.recommended_depth_m}m deep</span></div>`
+      : `<div class="result-row"><span class="label">Recommended Pond</span><span class="value" style="color:${sizing && sizing.data_unavailable ? '#8a6d1a' : '#b3413a'}">${(sizing && sizing.reason) || 'Not enough data to size this site'}</span></div>`;
+
+    html += `
+      <div class="rank-card" data-lat="${lat}" data-lon="${lon}" data-rank="${site.rank}">
+        <div class="rank-card-header">
+          <span class="rank-badge">${WELL_EMOJI} #${site.rank}</span>
+          <span class="rank-score">Score: <strong>${site.composite_score.toFixed(1)}</strong>/100</span>
+        </div>
+        <div class="rank-scores">
+          <span>Elev: ${site.scores.elevation_score.toFixed(0)}%</span>
+          <span>Drainage: ${site.scores.accumulation_score.toFixed(0)}%</span>
+          <span>Flatness: ${site.scores.slope_score.toFixed(0)}%</span>
+        </div>
+        <div class="rank-explanation">${site.explanation}</div>
+        <div class="result-row"><span class="label">Available Area</span><span class="value">${areaText}</span></div>
+        ${sizingRow}
+        <div class="result-row"><span class="label">Obstacles</span><span class="value" style="font-size:0.8rem">${obsText}</span></div>
+        <button class="layer-btn full-width" style="margin-top:10px; font-size:0.8rem;">View Full Analysis & Pond Plan</button>
+      </div>
+    `;
+  });
+
+  map.fitBounds(coords, { padding: [30, 30] });
+
+  resultsContent.innerHTML = `<h3 style="margin-bottom:15px; color:#2c5a3d;">Top Ranked Pond Sites</h3>` + html;
+
+  document.querySelectorAll(".rank-card").forEach(card => {
+    card.addEventListener("click", async () => {
+      const lat = parseFloat(card.getAttribute("data-lat"));
+      const lon = parseFloat(card.getAttribute("data-lon"));
+      const rank = card.getAttribute("data-rank");
+
+      // Visual feedback
+      document.querySelectorAll(".rank-card").forEach(c => c.classList.remove("active"));
+      card.classList.add("active");
+
+      // Detailed analysis for this specific site
+      map.setView([lat, lon], 16);
+      await analyzeAndRender(lat, lon, true, { rank: rank });
+    });
+  });
+}
 
 // ---- Enable the land record button once a file is chosen ----
 document.getElementById("landrecord-file").addEventListener("change", (e) => {
@@ -431,11 +911,14 @@ document.getElementById("landrecord-btn").addEventListener("click", async () => 
   btn.textContent = "Analyzing land record...";
   btn.disabled = true;
 
-  resultsPanel.classList.remove("hidden");
+  const myRequestId = ++currentRequestId;  // claim this render slot -- see currentRequestId comment above
+
+  showResultsPanel();
   resultsContent.innerHTML = `<p class="hint">Parsing land record, classifying parcels, and finding the best eligible site... (this can take 20-60s)</p>`;
 
   try {
     const rec = await suggestFromLandRecord(file);
+    if (myRequestId !== currentRequestId) return;  // a newer action started while this was in flight -- discard
 
     if (rec.pond_recommendation && rec.pond_recommendation.cannot_recommend && !rec.location) {
       // No eligible government land found anywhere in the record at all --
@@ -452,8 +935,18 @@ document.getElementById("landrecord-btn").addEventListener("click", async () => 
 
     const { lat, lon } = rec.location;
     if (siteMarker) map.removeLayer(siteMarker);
+
+    if (typeof topSiteMarkers !== "undefined") {
+      topSiteMarkers.forEach(m => map.removeLayer(m));
+      topSiteMarkers = [];
+      topSiteFootprints.forEach(l => map.removeLayer(l));
+      topSiteFootprints = [];
+      topSitePondFootprints.forEach(l => map.removeLayer(l));
+      topSitePondFootprints = [];
+    }
+
     siteMarker = L.marker([lat, lon], {
-      icon: L.divIcon({ className: "site-marker", html: "📄", iconSize: [24, 24] }),
+      icon: L.divIcon({ className: "site-marker", html: "📄", iconSize: [24, 24], iconAnchor: [12, 12] }),
     }).addTo(map);
     map.setView([lat, lon], 15);
     renderSiteSummary(rec, lat, lon, rec.auto_selected);
@@ -466,6 +959,7 @@ document.getElementById("landrecord-btn").addEventListener("click", async () => 
       `<p class="hint" style="color:#2c5a3d;">📄 From uploaded land record "${rec.land_record_summary.filename}" (${rec.land_record_summary.parcels_parsed} parcels: ${countsText})</p>` +
       resultsContent.innerHTML;
   } catch (err) {
+    if (myRequestId !== currentRequestId) return;
     resultsContent.innerHTML = `<p class="status-text error">${err.message}</p>`;
   } finally {
     btn.textContent = originalText;

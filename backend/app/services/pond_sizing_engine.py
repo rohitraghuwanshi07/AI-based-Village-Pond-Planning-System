@@ -45,6 +45,7 @@ def recommend_pond(
     required_volume_m3: float,
     available_site_area_m2: float,
     target_capture_fraction: float = 0.5,
+    data_unavailable: bool = False,
 ) -> dict:
     """
     Recommend a pond depth + surface area to capture a target fraction of the
@@ -60,6 +61,18 @@ def recommend_pond(
                                   reasonable planning range; capturing 100%
                                   of a whole year's runoff in one pond is
                                   rarely practical or necessary).
+        data_unavailable: True when available_site_area_m2 is 0 (or near it)
+                           because the live obstruction/land-use query for
+                           this site FAILED, not because the site was
+                           actually checked and found to have no room. A
+                           failed lookup and a genuinely fully-built-up site
+                           both produce the same "0 m2 available" number, but
+                           they call for a completely different message: one
+                           is "this site has nowhere to put a pond", the
+                           other is "we couldn't check this site, try again"
+                           -- treating them the same tells someone their
+                           good site is bad because of an infrastructure
+                           hiccup.
 
     Returns:
         dict with recommended_depth_m, recommended_surface_area_m2,
@@ -74,6 +87,21 @@ def recommend_pond(
     # recommended here at all, rather than a nonsensical 3m x 3m puddle.
     MIN_VIABLE_SITE_AREA_M2 = 20.0
     if available_site_area_m2 < MIN_VIABLE_SITE_AREA_M2:
+        if data_unavailable:
+            reason = (
+                "The live building/road/water-body check for this exact site "
+                "didn't succeed, so available land here couldn't be verified "
+                "-- this is NOT a report that the site has no room, just that "
+                "it hasn't been checked yet. Try again in a moment, or check "
+                "the location on satellite imagery yourself."
+            )
+        else:
+            reason = (
+                f"No pond can be recommended here: only {available_site_area_m2:.1f} m2 of "
+                f"eligible land was found (below the {MIN_VIABLE_SITE_AREA_M2:.0f} m2 practical "
+                f"minimum). Try a different location, or verify whether nearby land is actually "
+                f"government-owned and vacant through official records."
+            )
         return {
             "target_capture_fraction": target_capture_fraction,
             "target_volume_m3": round(target_volume_m3, 1),
@@ -86,12 +114,8 @@ def recommend_pond(
             "percent_of_annual_runoff_captured": 0.0,
             "side_slope_ratio": f"{SIDE_SLOPE_RATIO}:1 (horizontal:vertical)",
             "cannot_recommend": True,
-            "reason": (
-                f"No pond can be recommended here: only {available_site_area_m2:.1f} m2 of "
-                f"eligible land was found (below the {MIN_VIABLE_SITE_AREA_M2:.0f} m2 practical "
-                f"minimum). Try a different location, or verify whether nearby land is actually "
-                f"government-owned and vacant through official records."
-            ),
+            "data_unavailable": data_unavailable,
+            "reason": reason,
         }
 
     # Cap the pond's surface area at whatever flat land is actually available,
@@ -162,4 +186,6 @@ def recommend_pond(
         "site_area_sufficient_for_target": site_sufficient,
         "percent_of_annual_runoff_captured": round((best_volume / required_volume_m3) * 100, 1) if required_volume_m3 > 0 else 0.0,
         "side_slope_ratio": f"{SIDE_SLOPE_RATIO}:1 (horizontal:vertical)",
+        "cannot_recommend": False,
+        "data_unavailable": False,
     }

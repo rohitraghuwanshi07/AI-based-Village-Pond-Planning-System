@@ -23,25 +23,133 @@ All three share the same underlying pipeline (catchment -> rainfall -> runoff
 """
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+import asyncio
+import math
 import numpy as np
 from rasterio.features import rasterize
 from shapely.geometry import shape
 
-from app.services.rainfall_client import get_historical_rainfall
-from app.services.runoff_engine import estimate_daily_series_runoff, DEFAULT_CURVE_NUMBER, CURVE_NUMBERS
+from app.services.rainfall_client import get_historical_rainfall, fallback_rainfall_result
+from app.services.runoff_engine import (
+    estimate_daily_series_runoff,
+    estimate_annual_runoff_volume,
+    DEFAULT_CURVE_NUMBER,
+    CURVE_NUMBERS,
+)
 from app.services.pond_sizing_engine import recommend_pond
-from app.services.land_use_client import fetch_obstructions
+from app.services.land_use_client import fetch_obstructions, fetch_water_bodies_in_bbox
 from app.services.ownership_client import fetch_ownership_zones
 from app.services.site_suitability import find_eligible_patches, find_eligible_patches_from_parcels, find_vacant_patches
 from app.services.soil_client import fetch_soil_composition
 from app.services.elevation_client import fetch_dem
-from app.services.terrain_engine import load_dem, compute_slope_degrees
+from app.services.terrain_engine import load_dem, compute_slope_degrees, pixel_size_meters
 from app.services.catchment_engine import fill_depressions, flow_direction_d8, flow_accumulation
-from app.services.pond_site_selector import select_pond_site
+from app.services.pond_site_selector import select_pond_site, select_top_n_pond_sites, _generate_rank_explanation
 from app.services.land_record_parser import parse_land_record_file
 from app.routers.catchment import delineate as delineate_catchment_endpoint
 
 router = APIRouter(prefix="/api/pond", tags=["pond"])
+
+
+async def _fetch_water_polygons(south: float, north: float, west: float, east: float) -> list:
+    """Network-only half of the water-exclusion mask: fetch the raw water
+    geometries for a bbox. Split out from the rasterize step so callers can
+    kick this off CONCURRENTLY with the DEM download (fetch_dem) instead of
+    waiting for the DEM before even starting the water query -- the two are
+    independent network calls over the same bbox, so there's no reason to
+    pay for them one after another."""
+    water_data = await fetch_water_bodies_in_bbox(south, north, west, east)
+    return water_data.get("water", [])
+
+
+def _rasterize_water_exclusion_mask(
+    water_polys: list, south: float, north: float,
+    transform, out_shape: tuple[int, int], buffer_m: float = 50.0,
+) -> np.ndarray:
+    """
+    Rasterize already-fetched water-body geometries, buffered by buffer_m,
+    onto the DEM's own grid -- so pond-site selection can hard-exclude any
+    cell that's already water. Shared by /suggest-site and
+    /suggest-top-sites so both auto-siting paths apply the exact same
+    real-water-body safety check.
+    """
+    lat_mid = (north + south) / 2
+    lon_deg_per_m = 1.0 / (111_320.0 * math.cos(math.radians(lat_mid)))
+    buffer_deg = buffer_m * lon_deg_per_m
+
+    water_shapes = []
+    for w in water_polys:
+        try:
+            water_shapes.append((w.buffer(buffer_deg), 1))
+        except Exception:
+            continue
+
+    if not water_shapes:
+        return np.zeros(out_shape, dtype=bool)
+
+    return rasterize(
+        water_shapes, out_shape=out_shape, transform=transform,
+        fill=0, default_value=1, dtype="uint8",
+    ).astype(bool)
+
+
+def _years_analyzed(rainfall_result: dict) -> int:
+    """How many complete years of rainfall the runoff average above was
+    computed over -- kept as its own tiny helper (rather than threading an
+    extra return value out of _avg_annual_runoff_depth_mm) so the response
+    can report it without duplicating the runoff math itself."""
+    dates = rainfall_result["daily_series"]["dates"]
+    years_seen = sorted(set(d[:4] for d in dates))
+    complete_years = years_seen[1:-1] or years_seen
+    return len(complete_years)
+
+
+def _avg_annual_runoff_depth_mm(rainfall_result: dict, curve_number: float) -> float:
+    """
+    Average annual runoff depth (mm), computed by running the SCS-CN formula
+    on EACH day of each complete year in the fetched rainfall series (more
+    accurate than applying it once to an annual total -- see
+    estimate_daily_series_runoff's docstring), then averaging across years.
+    Shared between the single-site recommendation and the top-N ranked-site
+    pond sizing, so both use the exact same runoff methodology.
+    """
+    daily_values = rainfall_result["daily_series"]["precipitation_mm"]
+    dates = rainfall_result["daily_series"]["dates"]
+    years_seen = sorted(set(d[:4] for d in dates))
+    complete_years = years_seen[1:-1] or years_seen
+
+    annual_runoff_depths = []
+    for year in complete_years:
+        year_values = [v for d, v in zip(dates, daily_values) if d.startswith(year)]
+        result = estimate_daily_series_runoff(year_values, curve_number=curve_number)
+        annual_runoff_depths.append(result["total_runoff_depth_mm"])
+
+    return sum(annual_runoff_depths) / len(annual_runoff_depths) if annual_runoff_depths else 0.0
+
+
+def _runoff_from_rainfall(rainfall_result: dict, curve_number: float, catchment_area_m2: float) -> tuple[float, float]:
+    """
+    Compute (avg_annual_runoff_depth_mm, avg_annual_runoff_volume_m3) from a
+    rainfall_result dict, handling BOTH cases:
+      - live data available: run the more accurate day-by-day SCS-CN method
+        over the real fetched daily series (_avg_annual_runoff_depth_mm).
+      - rainfall_result["data_unavailable"] is True (the live Open-Meteo call
+        failed and rainfall_client.fallback_rainfall_result() was used): the
+        daily series is empty, so the day-by-day method would silently
+        return 0 -- which is wrong, not "no rain". Fall back to the single
+        annual-total SCS-CN application against the regional average instead,
+        so a failed network call degrades to a labeled estimate rather than
+        a fake near-zero result that cascades into a degenerate pond size.
+    """
+    if rainfall_result.get("data_unavailable"):
+        annual_result = estimate_annual_runoff_volume(
+            rainfall_result["annual_average_mm"], catchment_area_m2, curve_number,
+        )
+        return annual_result["runoff_depth_mm"], annual_result["runoff_volume_m3"]
+
+    depth_mm = _avg_annual_runoff_depth_mm(rainfall_result, curve_number)
+    volume_m3 = (depth_mm / 1000) * catchment_area_m2
+    return depth_mm, volume_m3
 
 
 async def _full_recommendation(
@@ -57,48 +165,76 @@ async def _full_recommendation(
     /suggest-site (auto-detected point)."""
     curve_number = CURVE_NUMBERS.get(land_cover, DEFAULT_CURVE_NUMBER)
 
+    # Parallelize independent high-latency tasks:
     # 1. Catchment delineation
-    catchment_result = await delineate_catchment_endpoint(
-        south=south, north=north, west=west, east=east,
-        pour_lat=pour_lat, pour_lon=pour_lon,
-    )
+    # 2. Historical rainfall
+    # 3. Land ownership/obstruction check
+    # 4. Soil composition
+    
+    tasks = [
+        delineate_catchment_endpoint(south=south, north=north, west=west, east=east, pour_lat=pour_lat, pour_lon=pour_lon),
+        get_historical_rainfall(pour_lat, pour_lon, years=rainfall_years),
+        fetch_soil_composition(pour_lat, pour_lon),
+    ]
+
+    # Add land check tasks based on whether area was provided
+    if available_site_area_m2 is None:
+        tasks.append(fetch_obstructions(pour_lat, pour_lon, radius_m=150.0))
+        tasks.append(fetch_ownership_zones(pour_lat, pour_lon, radius_m=150.0))
+    else:
+        # manual area provided, only check obstructions
+        tasks.append(fetch_obstructions(pour_lat, pour_lon, radius_m=150.0))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Unpack results with error handling
+    catchment_result = results[0]
+    rainfall_result = results[1]
+    soil_check = results[2]
+    
+    if isinstance(catchment_result, Exception):
+        raise HTTPException(status_code=500, detail=f"Catchment delineation failed: {catchment_result}")
+    if isinstance(rainfall_result, Exception):
+        # Fallback for rainfall if it fails -- clearly flagged regional
+        # estimate, not a silent 0 mm/yr (see fallback_rainfall_result's
+        # docstring for why that distinction matters).
+        rainfall_result = fallback_rainfall_result(pour_lat, pour_lon)
+    if isinstance(soil_check, Exception):
+        soil_check = {"query_succeeded": False, "note": f"Soil check failed: {soil_check}"}
+
+    # Process Catchment
     catchment_area_m2 = catchment_result["catchment_area_m2"]
 
-    # 2. Historical rainfall
-    rainfall_result = await get_historical_rainfall(pour_lat, pour_lon, years=rainfall_years)
-    daily_values = rainfall_result["daily_series"]["precipitation_mm"]
-    dates = rainfall_result["daily_series"]["dates"]
-    years_seen = sorted(set(d[:4] for d in dates))
-    complete_years = years_seen[1:-1] or years_seen
-
-    annual_runoff_depths = []
-    for year in complete_years:
-        year_values = [v for d, v in zip(dates, daily_values) if d.startswith(year)]
-        result = estimate_daily_series_runoff(year_values, curve_number=curve_number)
-        annual_runoff_depths.append(result["total_runoff_depth_mm"])
-
-    avg_annual_runoff_depth_mm = (
-        sum(annual_runoff_depths) / len(annual_runoff_depths) if annual_runoff_depths else 0.0
+    # Process Rainfall & Runoff
+    rainfall_data_unavailable = rainfall_result.get("data_unavailable", False)
+    avg_annual_runoff_depth_mm, avg_annual_runoff_volume_m3 = _runoff_from_rainfall(
+        rainfall_result, curve_number, catchment_area_m2,
     )
-    avg_annual_runoff_volume_m3 = (avg_annual_runoff_depth_mm / 1000) * catchment_area_m2
 
-    # 3. Real vacant-land patch analysis from OpenStreetMap, unless overridden.
-    # This finds actual CONTIGUOUS, GOVERNMENT-OWNED, vacant land near the site.
-    # IMPORTANT: there is no free authoritative land-ownership API. Government
-    # ownership is inferred from OpenStreetMap tags as a heuristic signal ONLY
-    # (see ownership_client.py). Land that isn't EXPLICITLY tagged government
-    # is treated as ownership-unverified and EXCLUDED, per a strict policy --
-    # this commonly means the eligible area will be small or zero, which is
-    # honest, correct behavior, not a bug. Buildings, roads, and water bodies
-    # are also excluded, and patches split apart by a road are NOT combined.
+    # Process Land Check (Ownership/Obstructions)
     site_check = None
     selected_patch = None
     ownership_layers = None
-    if available_site_area_m2 is None:
-        obstruction_data = await fetch_obstructions(pour_lat, pour_lon, radius_m=150.0)
-        ownership_data = await fetch_ownership_zones(pour_lat, pour_lon, radius_m=150.0)
+    # True whenever available_site_area_m2 ends up 0 (or capped/unverified)
+    # because a live query FAILED, not because the site was actually checked
+    # and found to have no room -- see recommend_pond's docstring for why
+    # that distinction matters for the message shown. Rainfall failure is
+    # folded in here too: a failed rainfall fetch is just as much "we
+    # couldn't check" as a failed obstruction/ownership fetch, so it should
+    # get the same "data unavailable" framing wherever it affects downstream
+    # numbers, rather than only being caveated in the rainfall block.
+    data_unavailable = rainfall_data_unavailable
 
-        if obstruction_data["query_succeeded"] and ownership_data["query_succeeded"]:
+    if available_site_area_m2 is None:
+        obstruction_data = results[3]
+        ownership_data = results[4]
+        
+        if isinstance(obstruction_data, Exception):
+            obstruction_data = {"query_succeeded": False, "error": str(obstruction_data)}
+        if isinstance(ownership_data, Exception):
+            ownership_data = {"query_succeeded": False, "error": str(ownership_data)}
+
+        if obstruction_data.get("query_succeeded") and ownership_data.get("query_succeeded"):
             patch_result = find_eligible_patches(
                 pour_lat, pour_lon,
                 buildings=obstruction_data["buildings"],
@@ -126,14 +262,13 @@ async def _full_recommendation(
                 "limitation": patch_result["ownership_data_limitation"],
             }
         else:
-            # Ownership/obstruction data unavailable -- per the strict policy,
-            # we do NOT guess a fallback area. State the limitation plainly.
             failed_reasons = []
-            if not obstruction_data["query_succeeded"]:
-                failed_reasons.append(f"obstruction check failed ({obstruction_data['error']})")
-            if not ownership_data["query_succeeded"]:
-                failed_reasons.append(f"ownership check failed ({ownership_data['error']})")
+            if not obstruction_data.get("query_succeeded"):
+                failed_reasons.append(f"obstruction check failed ({obstruction_data.get('error')})")
+            if not ownership_data.get("query_succeeded"):
+                failed_reasons.append(f"ownership check failed ({ownership_data.get('error')})")
             available_site_area_m2 = 0.0
+            data_unavailable = True
             site_check = {
                 "available_area_m2": 0.0,
                 "note": (
@@ -144,21 +279,11 @@ async def _full_recommendation(
                 ),
             }
     else:
-        # A manual area was provided -- ownership is intentionally NOT checked
-        # (that requires the live check, enabled by leaving the area field
-        # blank). But we still make a best-effort attempt to check for real
-        # buildings/roads/water bodies nearby and CAP the manual number if
-        # they'd eat into it significantly, rather than blindly trusting a
-        # number that might sit right on top of a real structure. If this
-        # lighter check also fails (same underlying network issue as the
-        # full ownership check), we fall back to trusting the manual number
-        # as-is, clearly flagged as unverified.
-        try:
-            obstruction_data = await fetch_obstructions(pour_lat, pour_lon, radius_m=150.0)
-        except Exception as e:
-            obstruction_data = {"query_succeeded": False, "error": str(e)}
+        obstruction_data = results[3]
+        if isinstance(obstruction_data, Exception):
+            obstruction_data = {"query_succeeded": False, "error": str(obstruction_data)}
 
-        if obstruction_data["query_succeeded"]:
+        if obstruction_data.get("query_succeeded"):
             patch_result = find_vacant_patches(
                 pour_lat, pour_lon,
                 buildings=obstruction_data["buildings"],
@@ -209,21 +334,79 @@ async def _full_recommendation(
                 ),
             }
 
-    # 4. Soil composition (seepage risk) at the site
-    soil_check = await fetch_soil_composition(pour_lat, pour_lon)
-
     # 5. Pond sizing recommendation
     pond_result = recommend_pond(
         required_volume_m3=avg_annual_runoff_volume_m3,
         available_site_area_m2=available_site_area_m2,
         target_capture_fraction=target_capture_fraction,
+        data_unavailable=data_unavailable,
     )
+
+    # 6. Scoring + plain-language explanation for the site actually being
+    # shown here -- computed regardless of whether this is a fresh manual
+    # click or "View Full Analysis" on an already-ranked site. It used to
+    # only run for a genuinely fresh manual click (auto_selected_info is
+    # None), which meant clicking into a ranked site's "View Full Analysis"
+    # lost its whole explanation/obstacle breakdown even though the ranked
+    # list it came from had shown exactly that -- the detail view looked
+    # like a downgrade from the list it was opened from.
+    manual_score_info = None
+    if "terrain_at_snapped_point" in catchment_result:
+        terrain = catchment_result["terrain_at_snapped_point"]
+        # Same normalization logic as pond_site_selector
+        elev_range = max(terrain["elevation_max"] - terrain["elevation_min"], 1e-9)
+        norm_elev = 1.0 - (terrain["elevation_m"] - terrain["elevation_min"]) / elev_range
+        
+        acc_range = max(terrain["accumulation_max"] - 0, 1e-9)
+        norm_acc = terrain["accumulation"] / acc_range
+        
+        slope_range = max(terrain["slope_max"] - terrain["slope_min"], 1e-9)
+        norm_slope = 1.0 - (terrain["slope_deg"] - terrain["slope_min"]) / slope_range
+
+        elevation_weight, accumulation_weight, slope_weight = 0.40, 0.25, 0.15
+        total_weight = elevation_weight + accumulation_weight + slope_weight
+        
+        composite = (elevation_weight * norm_elev + accumulation_weight * norm_acc + slope_weight * norm_slope) / total_weight
+        raw_score = composite * 100.0
+
+        scores = {
+            "elevation_score": round(norm_elev * 100, 1),
+            "accumulation_score": round(norm_acc * 100, 1),
+            "slope_score": round(norm_slope * 100, 1)
+        }
+        
+        buildings_nearby = site_check.get("buildings_found_nearby", 0) if site_check else 0
+        roads_nearby = site_check.get("roads_found_nearby", 0) if site_check else 0
+        water_bodies_nearby = site_check.get("water_bodies_found_nearby", 0) if site_check else 0
+
+        penalty = 0 if data_unavailable else (buildings_nearby * 5) + (roads_nearby * 10) + (water_bodies_nearby * 15)
+        final_score = max(0, raw_score - penalty)
+
+        nearby = {
+            "buildings_nearby": buildings_nearby,
+            "roads_nearby": roads_nearby,
+            "water_bodies_nearby": water_bodies_nearby,
+            "data_unavailable": data_unavailable,
+        }
+        rank_label = auto_selected_info["rank"] if auto_selected_info and auto_selected_info.get("rank") else "Manual"
+        explanation = _generate_rank_explanation(
+            rank_label, scores, nearby, final_score, raw_score=raw_score, data_unavailable=data_unavailable,
+        )
+
+        manual_score_info = {
+            "raw_score": round(raw_score, 1),
+            "composite_score": round(final_score, 1),
+            "scores": scores,
+            "nearby_obstacles": nearby,
+            "explanation": explanation,
+        }
 
     return {
         "location": {"lat": pour_lat, "lon": pour_lon},
         "vacant_land_boundary_geojson": selected_patch["boundary_geojson"] if selected_patch else None,
         "ownership_layers": ownership_layers,
         "auto_selected": auto_selected_info,
+        "manual_score_info": manual_score_info,
         "catchment": {
             "area_m2": catchment_area_m2,
             "area_hectares": catchment_result["catchment_area_hectares"],
@@ -231,9 +414,11 @@ async def _full_recommendation(
             "snapped_pour_point": catchment_result["pour_point_snapped"],
         },
         "rainfall": {
-            "years_analyzed": len(complete_years),
+            "years_analyzed": _years_analyzed(rainfall_result),
             "annual_average_mm": rainfall_result["annual_average_mm"],
             "monsoon_average_mm": rainfall_result["monsoon_average_mm"],
+            "data_unavailable": rainfall_data_unavailable,
+            "note": rainfall_result.get("note"),
         },
         "runoff": {
             "land_cover_assumed": land_cover,
@@ -304,21 +489,42 @@ async def suggest_site(
     Example:
     GET /api/pond/suggest-site?south=21.10&north=21.19&west=79.04&east=79.13
     """
+    # DEM download and the water-body query are independent network calls
+    # over the same bbox -- fire them concurrently instead of paying for
+    # them one after another.
+    dem_task = asyncio.create_task(fetch_dem(south, north, west, east))
+    water_task = asyncio.create_task(_fetch_water_polygons(south, north, west, east))
+
     try:
-        dem_path = await fetch_dem(south, north, west, east)
+        dem_path = await dem_task
     except RuntimeError as e:
+        water_task.cancel()
         raise HTTPException(status_code=500, detail=str(e))
 
     elevation, transform, crs = load_dem(dem_path)
     slope = compute_slope_degrees(elevation, transform)
 
     filled = fill_depressions(np.nan_to_num(elevation, nan=99999.0))
-    px_m = abs(transform.a) * 111320
-    py_m = abs(transform.e) * 111320
+    px_m, py_m = pixel_size_meters(transform, elevation.shape)
     downstream_r, downstream_c = flow_direction_d8(filled, px_m, py_m)
     acc = flow_accumulation(filled, downstream_r, downstream_c)
 
-    row, col, site_info = select_pond_site(slope, acc, elevation=elevation, max_slope_deg=max_slope_deg)
+    # Hard-exclude existing water bodies BEFORE scoring. Without this, the
+    # scoring itself (low elevation + high flow accumulation) would actively
+    # favor cells that are already inside a river/lake/canal -- that's what
+    # was causing the auto-selected site to sometimes land in water.
+    try:
+        water_polys = await water_task
+    except Exception:
+        water_polys = []  # water check is a safety layer, not a hard dependency -- don't fail the whole request over it
+    water_exclusion_mask = _rasterize_water_exclusion_mask(
+        water_polys, south, north, transform, elevation.shape,
+    )
+
+    row, col, site_info = select_pond_site(
+        slope, acc, elevation=elevation, max_slope_deg=max_slope_deg,
+        water_exclusion_mask=water_exclusion_mask,
+    )
     lon, lat = transform * (col, row)
 
     result = await _full_recommendation(
@@ -327,6 +533,299 @@ async def suggest_site(
         auto_selected_info=site_info,
     )
     return result
+
+
+@router.get("/suggest-top-sites")
+async def suggest_top_sites(
+    south: float = Query(..., description="Southern latitude bound of the search area"),
+    north: float = Query(..., description="Northern latitude bound"),
+    west: float = Query(..., description="Western longitude bound"),
+    east: float = Query(..., description="Eastern longitude bound"),
+    boundary_polygon: str | None = Query(None, description="Optional lon,lat;lon,lat string of the bounding polygon"),
+    n_sites: int = Query(3, ge=1, le=10, description="Number of top sites to return"),
+    max_slope_deg: float = Query(8.0, ge=1.0, le=45.0, description="Max slope considered suitable"),
+    land_cover: str = Query("cultivated_land", description=f"One of: {list(CURVE_NUMBERS.keys())}"),
+    target_capture_fraction: float = Query(0.5, ge=0.05, le=1.0, description="Fraction of annual runoff each ranked pond should target capturing"),
+    rainfall_years: int = Query(10, ge=1, le=30),
+):
+    """
+    Finds and ranks the top N candidate pond sites within a search area.
+    Explicitly excludes sites on or near existing water bodies. Each ranked
+    site also gets its own recommended pond size (depth + surface area),
+    sized from that site's own catchment/runoff -- not just its eligible
+    land area -- so the "sub-boundary" shown for each rank reflects how big
+    that pond should actually be, not just how much land happens to be free.
+    """
+    curve_number = CURVE_NUMBERS.get(land_cover, DEFAULT_CURVE_NUMBER)
+
+    # Cap the search area. The "whole village" flow uses whatever bbox the
+    # geocoder returned -- Photon gives some places (esp. a town/tehsil
+    # searched by name rather than a specific landmark) an administrative
+    # "extent" that can be tens of km across. That doesn't just mean "a
+    # bigger DEM download" -- every step below (Overpass water/obstruction
+    # queries, rasterizing the exclusion mask, D8 flow routing) scales with
+    # pixel count, so an uncapped bbox is the single biggest thing standing
+    # between this endpoint and a fast, predictable response time. A pond
+    # site search is inherently local anyway (a village doesn't need a
+    # 40km-wide window to find its 3 best pond spots), so the box is
+    # shrunk toward its own center rather than toward some fixed corner --
+    # this keeps whatever point the person actually searched for centered,
+    # just tighter.
+    MAX_SEARCH_SPAN_DEG = 0.15  # ~16.5km -- comfortably covers a real village or a generously-drawn boundary selection; only kicks in for outsized admin-area geocode extents
+    if (north - south) > MAX_SEARCH_SPAN_DEG or (east - west) > MAX_SEARCH_SPAN_DEG:
+        center_lat, center_lon = (south + north) / 2, (west + east) / 2
+        half = MAX_SEARCH_SPAN_DEG / 2
+        south = max(south, center_lat - half)
+        north = min(north, center_lat + half)
+        west = max(west, center_lon - half)
+        east = min(east, center_lon + half)
+
+    # DEM download, the water-body query, and the rainfall lookup are all
+    # independent network calls -- rainfall in particular only needs a
+    # representative point (climatology doesn't meaningfully vary across a
+    # search area this size), so it's fetched ONCE here and shared across
+    # every candidate below, rather than once per candidate.
+    dem_task = asyncio.create_task(fetch_dem(south, north, west, east))
+    water_task = asyncio.create_task(_fetch_water_polygons(south, north, west, east))
+    rainfall_task = asyncio.create_task(
+        get_historical_rainfall((south + north) / 2, (west + east) / 2, years=rainfall_years)
+    )
+
+    try:
+        dem_path = await dem_task
+    except RuntimeError as e:
+        water_task.cancel()
+        rainfall_task.cancel()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    elevation, transform, crs = load_dem(dem_path)
+    slope = compute_slope_degrees(elevation, transform)
+
+    filled = fill_depressions(np.nan_to_num(elevation, nan=99999.0))
+    px_m, py_m = pixel_size_meters(transform, elevation.shape)
+    downstream_r, downstream_c = flow_direction_d8(filled, px_m, py_m)
+    acc = flow_accumulation(filled, downstream_r, downstream_c)
+
+    rows, cols = elevation.shape
+    try:
+        water_polys = await water_task
+    except Exception:
+        water_polys = []  # water check is a safety layer, not a hard dependency -- don't fail the whole request over it
+    exclusion_mask = _rasterize_water_exclusion_mask(
+        water_polys, south, north, transform, (rows, cols),
+    )
+
+    if boundary_polygon:
+        from shapely.geometry import Polygon as ShapelyPolygon
+        try:
+            coords = [tuple(map(float, pt.split(','))) for pt in boundary_polygon.split(';')]
+            if len(coords) >= 3:
+                user_poly = ShapelyPolygon(coords)
+                if not user_poly.is_valid:
+                    # A self-intersecting ("bowtie") polygon -- e.g. 4 corners
+                    # supplied in other than perimeter order -- is technically
+                    # invalid and can rasterize to near-ZERO real area even
+                    # though it looks like a normal quadrilateral. buffer(0)
+                    # is the standard Shapely fix: it resolves self-
+                    # intersections into the equivalent valid geometry
+                    # (usually via the union of its non-overlapping parts)
+                    # instead of silently excluding almost the whole area the
+                    # user actually intended to select.
+                    user_poly = user_poly.buffer(0)
+                # rasterize fills background with 1 (excluded), draws polygon with 0 (allowed)
+                poly_mask = rasterize(
+                    [(user_poly, 0)], out_shape=(rows, cols), transform=transform,
+                    fill=1, dtype="uint8"
+                ).astype(bool)
+                exclusion_mask = np.logical_or(exclusion_mask, poly_mask)
+        except Exception as e:
+            print(f"Failed to parse boundary_polygon: {e}")
+
+    # Select top N candidate sites
+    candidates = select_top_n_pond_sites(
+        slope, acc, elevation=elevation, max_slope_deg=max_slope_deg,
+        water_exclusion_mask=exclusion_mask, n_sites=n_sites,
+        transform=transform
+    )
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No suitable pond sites found in this area.")
+
+    # Fetch all obstructions in bulk for the candidates
+    from app.services.land_use_client import fetch_obstructions_bulk
+    from shapely.geometry import Point
+    
+    cand_coords = [(c["lat"], c["lon"]) for c in candidates]
+    bulk_obs = await fetch_obstructions_bulk(cand_coords, radius_m=150.0)
+
+    # Delineate each candidate's own catchment. fill_depressions/flow_direction/
+    # flow_accumulation depend only on the DEM (not on which candidate point
+    # we're delineating from), and were ALREADY computed above for site
+    # SELECTION -- so each candidate here only needs the cheap, genuinely
+    # per-point part (snap-to-channel + trace upstream), reusing that same
+    # computation instead of redoing it 3 times. That redundant 3x redo used
+    # to be the single biggest cost this endpoint added when pond sizing was
+    # introduced (~2s of DEM-wide prep repeated per candidate); reusing it
+    # brings all 3 candidates down to a fraction of a second combined, and
+    # unlike spreading those 3 redone computations across threads/processes,
+    # this is a real reduction in total work rather than just parallelizing
+    # the same work (which doesn't help on a single-core machine anyway).
+    from app.routers.catchment import _catchment_from_precomputed
+    from app.services.catchment_engine import build_reverse_graph
+
+    # Built ONCE and reused for every candidate below -- the reverse
+    # drainage graph depends only on downstream_r/downstream_c (already
+    # fixed for this whole request), not on which candidate is being
+    # traced. Without this, delineate_catchment used to rebuild the same
+    # graph from scratch inside each of the 3 calls below. See
+    # build_reverse_graph's docstring.
+    reverse_graph = build_reverse_graph(downstream_r, downstream_c)
+
+    catchment_results = []
+    for c in candidates:
+        try:
+            catchment_results.append(
+                _catchment_from_precomputed(
+                    elevation, transform, downstream_r, downstream_c, acc, c["lat"], c["lon"],
+                    reverse_graph=reverse_graph,
+                )
+            )
+        except Exception as e:
+            catchment_results.append(e)
+
+    try:
+        rainfall_result = await rainfall_task
+    except Exception:
+        rainfall_result = fallback_rainfall_result((south + north) / 2, (west + east) / 2)
+    rainfall_data_unavailable = rainfall_result.get("data_unavailable", False)
+
+    if rainfall_data_unavailable:
+        # Live fetch failed -- use the single-shot SCS-CN runoff depth for
+        # the regional fallback average instead of the (empty) daily
+        # series, same reasoning as _runoff_from_rainfall above. This path
+        # sizes ponds per-candidate against each candidate's own catchment
+        # area below, so only the runoff DEPTH (mm) is shared here; each
+        # candidate turns it into its own volume once its catchment area is
+        # known.
+        avg_annual_runoff_depth_mm = estimate_annual_runoff_volume(
+            rainfall_result["annual_average_mm"], 1.0, curve_number,
+        )["runoff_depth_mm"]
+    else:
+        avg_annual_runoff_depth_mm = _avg_annual_runoff_depth_mm(rainfall_result, curve_number)
+
+    # Lightweight suitability check for each candidate
+    def process_candidate_sync(cand, catchment_result):
+        lat, lon = cand["lat"], cand["lon"]
+        center = Point(lon, lat)
+        
+        # Filter bulk observations to just this candidate's 150m radius
+        # (approximate degree conversion for filtering: 150m is ~0.0014 degrees)
+        radius_deg = 150.0 / 111320.0
+        
+        local_bldgs = [b for b in bulk_obs["buildings"] if b.distance(center) <= radius_deg]
+        local_roads = [r for r in bulk_obs["roads"] if r.distance(center) <= radius_deg]
+        local_water = [w for w in bulk_obs["water"] if w.distance(center) <= radius_deg]
+        
+        obs_local = {
+            "buildings": local_bldgs,
+            "roads": local_roads,
+            "water": local_water,
+            "query_succeeded": bulk_obs.get("query_succeeded", False)
+        }
+
+        buildings_nearby = len(local_bldgs)
+        roads_nearby = len(local_roads)
+        water_bodies_nearby = len(local_water)
+
+        # Distinguish "we checked and there's genuinely nothing nearby" from
+        # "the live Overpass query failed, so these are placeholder zeros" --
+        # the two produce identical counts (0/0/0) but mean opposite things
+        # for whether it's safe to trust "0 obstacles" as good news. A
+        # failed rainfall fetch (rainfall_data_unavailable, from the outer
+        # scope) is the same kind of "we couldn't check" and folds in here
+        # too, since it also feeds this candidate's pond_sizing below.
+        data_unavailable = (not obs_local["query_succeeded"]) or rainfall_data_unavailable
+
+        available_area = 0.0
+        vacant_geojson = None
+        if obs_local["query_succeeded"]:
+            patch_res = find_vacant_patches(
+                lat, lon, local_bldgs, local_roads, local_water,
+                search_radius_m=150.0
+            )
+            if patch_res["patches"] and patch_res["selected_patch_index"] is not None:
+                sel_patch = patch_res["patches"][patch_res["selected_patch_index"]]
+                available_area = sel_patch["area_m2"]
+                vacant_geojson = sel_patch["boundary_geojson"]
+
+        nearby = {
+            "buildings_nearby": buildings_nearby,
+            "roads_nearby": roads_nearby,
+            "water_bodies_nearby": water_bodies_nearby,
+            "data_unavailable": data_unavailable,
+        }
+
+        raw_score = cand["composite_score"]
+        penalty = 0 if data_unavailable else (buildings_nearby * 5) + (roads_nearby * 10) + (water_bodies_nearby * 15)
+        final_score = max(0, raw_score - penalty)
+
+        # Recommend an actual pond size (depth + surface area) for this
+        # specific site, from ITS OWN catchment -- not just how much land is
+        # free. This is the "sub-boundary" shown for each ranked site: the
+        # available-land patch above is how much room there is; this is how
+        # big the pond itself should actually be within that room.
+        if isinstance(catchment_result, Exception) or catchment_result is None:
+            pond_sizing = {
+                "cannot_recommend": True,
+                "data_unavailable": False,
+                "reason": f"Catchment could not be computed for this site: {catchment_result}",
+                "recommended_surface_area_m2": None,
+            }
+            catchment_area_m2 = None
+        else:
+            catchment_area_m2 = catchment_result["catchment_area_m2"]
+            runoff_volume_m3 = (avg_annual_runoff_depth_mm / 1000) * catchment_area_m2
+            pond_sizing = recommend_pond(runoff_volume_m3, available_area, target_capture_fraction, data_unavailable=data_unavailable)
+
+        return {
+            "rank": cand["rank"],
+            "location": {"lat": lat, "lon": lon},
+            "composite_score": final_score,
+            "raw_score": raw_score,
+            "scores": cand["scores"],
+            "nearby_obstacles": nearby,
+            "available_area_m2": available_area,
+            "vacant_land_boundary_geojson": vacant_geojson,
+            "catchment_area_m2": catchment_area_m2,
+            "pond_sizing": pond_sizing,
+            "selection_info": cand["selection_info"]
+        }
+
+    ranked_sites = [process_candidate_sync(c, catchment_result) for c, catchment_result in zip(candidates, catchment_results)]
+
+    # Re-sort by final score just in case penalties changed the ordering
+    ranked_sites.sort(key=lambda x: x["composite_score"], reverse=True)
+    # Update ranks after re-sort
+    for i, site in enumerate(ranked_sites):
+        site["rank"] = i + 1
+        site["explanation"] = _generate_rank_explanation(
+            site["rank"], 
+            site["scores"], 
+            site["nearby_obstacles"], 
+            site["composite_score"], 
+            raw_score=site.get("raw_score"),
+            data_unavailable=site["nearby_obstacles"].get("data_unavailable", False),
+        )
+
+    return {
+        "ranked_sites": ranked_sites,
+        "rainfall": {
+            "annual_average_mm": rainfall_result["annual_average_mm"],
+            "monsoon_average_mm": rainfall_result.get("monsoon_average_mm"),
+            "data_unavailable": rainfall_data_unavailable,
+            "note": rainfall_result.get("note"),
+        },
+    }
 
 
 @router.post("/suggest-from-landrecord")
@@ -430,8 +929,7 @@ async def suggest_from_landrecord(
     elevation, transform, crs = load_dem(dem_path)
     slope = compute_slope_degrees(elevation, transform)
     filled = fill_depressions(np.nan_to_num(elevation, nan=99999.0))
-    px_m = abs(transform.a) * 111320
-    py_m = abs(transform.e) * 111320
+    px_m, py_m = pixel_size_meters(transform, elevation.shape)
     downstream_r, downstream_c = flow_direction_d8(filled, px_m, py_m)
     acc = flow_accumulation(filled, downstream_r, downstream_c)
 

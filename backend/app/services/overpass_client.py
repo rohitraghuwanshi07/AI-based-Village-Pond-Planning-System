@@ -22,6 +22,7 @@ All of these are free, community-run public Overpass instances -- no API key
 for any of them.
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -84,40 +85,67 @@ def _write_cache(query: str, data: dict) -> None:
         pass  # caching is a best-effort optimization, never fail the request over it
 
 
-async def query_overpass(query: str, timeout: float = 30.0, retries_per_mirror: int = 2) -> dict:
+async def query_overpass(query: str, timeout: float = 15.0, retries_per_mirror: int = 1) -> dict:
     """
-    POST an Overpass QL query, trying each mirror in order until one succeeds,
-    with a short retry per mirror and a local disk cache to avoid repeat
-    live calls for the same query within CACHE_TTL_SECONDS.
+    POST an Overpass QL query to ALL mirrors CONCURRENTLY and return whichever
+    responds successfully first (a "race"), with a local disk cache to avoid
+    repeat live calls for the same query within CACHE_TTL_SECONDS.
+
+    Why a race instead of trying mirrors one at a time: the public mirrors
+    have wildly inconsistent load. overpass-api.de in particular is often
+    slow enough to eat a full timeout. The previous implementation tried
+    mirrors strictly in sequence, each with its own retries -- so a single
+    degraded mirror at the front of the list could burn through
+    len(OVERPASS_MIRRORS) * retries_per_mirror full timeouts (worst case,
+    over a minute) before ever reaching a mirror that would have answered
+    in under a second. Firing requests at every mirror at once and taking
+    the first success means the effective wait is bounded by the FASTEST
+    mirror on any given call, not the slowest one -- and we still fall back
+    correctly if all of them are genuinely down.
 
     Returns the parsed JSON response dict.
-    Raises the last encountered exception if every mirror fails, with a
-    message listing which mirrors were tried -- so a caller/log clearly shows
-    this wasn't a single-endpoint fluke.
+    Raises RuntimeError if every mirror fails, with a message listing which
+    mirrors were tried -- so a caller/log clearly shows this wasn't a
+    single-endpoint fluke.
     """
     cached = _read_cache(query)
     if cached is not None:
         return cached
 
-    last_error = None
-    errors_by_mirror = []
-
-    for url in OVERPASS_MIRRORS:
+    async def _try_mirror(url: str) -> dict:
+        last_exc = None
         for attempt in range(retries_per_mirror):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     resp = await client.post(url, data={"data": query}, headers=HEADERS)
                     resp.raise_for_status()
-                    data = resp.json()
-                    _write_cache(query, data)
-                    return data
+                    return resp.json()
             except Exception as e:
-                last_error = e
+                last_exc = e
                 if attempt < retries_per_mirror - 1:
-                    continue  # brief retry against the SAME mirror once before moving on
+                    await asyncio.sleep(0.5)
+        raise last_exc
+
+    tasks = {asyncio.create_task(_try_mirror(url)): url for url in OVERPASS_MIRRORS}
+    pending = set(tasks.keys())
+    errors_by_mirror = []
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            url = tasks[task]
+            try:
+                data = task.result()
+            except Exception as e:
                 errors_by_mirror.append(f"{url}: {e}")
+                continue
+            # First success wins -- cancel the rest, we don't need them.
+            for p in pending:
+                p.cancel()
+            _write_cache(query, data)
+            return data
 
     raise RuntimeError(
         f"All Overpass mirrors failed. Tried {len(OVERPASS_MIRRORS)} servers "
-        f"({retries_per_mirror} attempts each): {'; '.join(errors_by_mirror)}"
-    ) from last_error
+        f"({retries_per_mirror} attempt(s) each): {'; '.join(errors_by_mirror)}"
+    )

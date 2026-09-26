@@ -1,0 +1,9 @@
+backend/.venv/
+backend/data/
+backend/server.log
+backend/out.json
+backend/test_overpass.py
+backend/test_overpass2.py
+__pycache__/
+*.pyc
+.DS_Store

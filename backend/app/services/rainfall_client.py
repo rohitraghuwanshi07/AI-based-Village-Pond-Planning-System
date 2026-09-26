@@ -19,6 +19,46 @@ ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HEADERS = {"User-Agent": "village-pond-planner-student-project"}
 
 
+_RAINFALL_CACHE = {}
+
+# Long-period regional average annual rainfall (mm), used ONLY as a fallback
+# when the live Open-Meteo lookup fails outright (network error, timeout,
+# blocked egress, etc). This is a mid-range figure for the Chhattisgarh
+# plain -- IMD's Durg district normal is ~1100-1140mm/yr and CGWB's
+# 1994-2012 district average is ~1055mm/yr -- so it's a defensible
+# regional estimate, NOT a per-site measurement. Callers MUST treat a
+# result carrying data_unavailable=True as an approximation, not a real
+# reading, and should retry the live call when possible.
+FALLBACK_ANNUAL_RAINFALL_MM = 1100.0
+
+
+def fallback_rainfall_result(lat: float, lon: float) -> dict:
+    """
+    Build a clearly-flagged stand-in result for when get_historical_rainfall's
+    live API call fails. Returning this instead of a silent 0 mm/yr matters:
+    a real 0 mm/yr would (correctly) mean "no runoff, no pond possible here",
+    but a FAILED fetch reported the same way looks identical downstream and
+    silently produces a degenerate near-zero pond recommendation that has
+    nothing to do with the site. data_unavailable=True lets callers tell
+    the two situations apart and warn the user instead of quietly guessing.
+    """
+    return {
+        "lat": lat,
+        "lon": lon,
+        "years_analyzed": 0,
+        "annual_average_mm": FALLBACK_ANNUAL_RAINFALL_MM,
+        "monsoon_average_mm": None,
+        "yearly_totals_mm": {},
+        "daily_series": {"dates": [], "precipitation_mm": []},
+        "data_unavailable": True,
+        "note": (
+            "The live rainfall lookup (Open-Meteo) failed, so this uses a "
+            f"regional long-term average ({FALLBACK_ANNUAL_RAINFALL_MM:.0f} mm/yr) "
+            "instead of a site-specific reading. Runoff and pond-size figures "
+            "below are rough estimates until this can be retried."
+        ),
+    }
+
 async def get_historical_rainfall(lat: float, lon: float, years: int = 10) -> dict:
     """
     Fetch daily rainfall for the past `years` years at a location and summarize it.
@@ -31,6 +71,10 @@ async def get_historical_rainfall(lat: float, lon: float, years: int = 10) -> di
         dict with annual_average_mm, monsoon_average_mm, yearly_totals, and
         the raw daily series (dates + precipitation_mm).
     """
+    cache_key = f"{round(lat, 4)}_{round(lon, 4)}_{years}"
+    if cache_key in _RAINFALL_CACHE:
+        return _RAINFALL_CACHE[cache_key]
+
     end_date = date.today().replace(day=1)  # avoid partial current month
     start_date = end_date.replace(year=end_date.year - years)
 
@@ -78,7 +122,7 @@ async def get_historical_rainfall(lat: float, lon: float, years: int = 10) -> di
         if complete_years else 0.0
     )
 
-    return {
+    result = {
         "lat": lat,
         "lon": lon,
         "years_analyzed": len(complete_years),
@@ -86,4 +130,8 @@ async def get_historical_rainfall(lat: float, lon: float, years: int = 10) -> di
         "monsoon_average_mm": round(monsoon_average_mm, 1),
         "yearly_totals_mm": {y: round(v, 1) for y, v in yearly_totals.items()},
         "daily_series": {"dates": dates, "precipitation_mm": values},
+        "data_unavailable": False,
     }
+    
+    _RAINFALL_CACHE[cache_key] = result
+    return result
