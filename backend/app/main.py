@@ -9,9 +9,6 @@ Then open http://127.0.0.1:8000/docs for the auto-generated API docs
 """
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import village, rainfall, terrain, catchment, pond
@@ -33,9 +30,12 @@ app.add_middleware(
 
 @app.get("/", tags=["system"])
 def root():
-    """Serve the frontend application."""
-    frontend_dir = Path(__file__).resolve().parents[2] / "frontend"
-    return FileResponse(frontend_dir / "index.html")
+    """Root endpoint — confirms the API is running."""
+    return {
+        "message": "Village Pond Planning System API is running",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
 
 
 @app.get("/api/health", tags=["system"])
@@ -48,8 +48,3 @@ app.include_router(rainfall.router)
 app.include_router(terrain.router)
 app.include_router(catchment.router)
 app.include_router(pond.router)
-
-# Serve the frontend from the same FastAPI origin.
-# API routes above continue to handle /api/* and /docs.
-frontend_dir = Path(__file__).resolve().parents[2] / "frontend"
-app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")

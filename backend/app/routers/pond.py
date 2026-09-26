@@ -580,6 +580,27 @@ async def suggest_top_sites(
         west = max(west, center_lon - half)
         east = min(east, center_lon + half)
 
+    # Enforce a MINIMUM span too. There was no floor here before: a
+    # hand-drawn 4-corner boundary selection can easily be a tiny box (a
+    # quick demo click, or 4 corners placed close together), and a DEM
+    # window that small (a) doesn't give the D8 flow-routing algorithm
+    # enough real upstream terrain to find a genuine drainage point, and
+    # (b) can trip OpenTopography's own minimum-area requirement, which
+    # comes back as a request failure every single time for that box,
+    # regardless of exactly where it's drawn. Padding out to a workable
+    # minimum here does NOT loosen what the user actually gets recommended
+    # -- the drawn polygon is still applied afterwards as a hard exclusion
+    # mask, so candidate sites are still confined to inside it; this just
+    # gives the terrain analysis enough surrounding context to work with.
+    MIN_SEARCH_SPAN_DEG = 0.03  # ~3.3km
+    if (north - south) < MIN_SEARCH_SPAN_DEG or (east - west) < MIN_SEARCH_SPAN_DEG:
+        center_lat, center_lon = (south + north) / 2, (west + east) / 2
+        half = MIN_SEARCH_SPAN_DEG / 2
+        south = min(south, center_lat - half)
+        north = max(north, center_lat + half)
+        west = min(west, center_lon - half)
+        east = max(east, center_lon + half)
+
     # DEM download, the water-body query, and the rainfall lookup are all
     # independent network calls -- rainfall in particular only needs a
     # representative point (climatology doesn't meaningfully vary across a

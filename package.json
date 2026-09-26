@@ -1,0 +1,24 @@
+{
+  "name": "ai-based-village-pond-planning-system",
+  "version": "1.0.0",
+  "description": "A web application that helps identify suitable locations for pond construction in rural areas by analyzing terrain, catchment area, and historical rainfall data — built entirely with **free and open-source tools**, with no paid APIs or licensing costs.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohitraghuwanshi07/AI-based-Village-Pond-Planning-System.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/rohitraghuwanshi07/AI-based-Village-Pond-Planning-System/issues"
+  },
+  "homepage": "https://github.com/rohitraghuwanshi07/AI-based-Village-Pond-Planning-System#readme"
+}

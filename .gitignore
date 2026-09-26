@@ -4,6 +4,7 @@ backend/server.log
 backend/out.json
 backend/test_overpass.py
 backend/test_overpass2.py
+venv/
 __pycache__/
 *.pyc
 .DS_Store

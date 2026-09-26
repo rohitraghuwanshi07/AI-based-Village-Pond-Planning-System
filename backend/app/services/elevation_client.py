@@ -67,8 +67,33 @@ async def fetch_dem(
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(OPENTOPO_URL, params=params)
-        resp.raise_for_status()
+        try:
+            resp = await client.get(OPENTOPO_URL, params=params)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # OpenTopography returns a 4xx for a malformed/oversized/undersized
+            # bbox and a 5xx when its own tile-generation backend is
+            # overloaded. Both used to propagate as a raw httpx exception,
+            # which every caller's `except RuntimeError` was blind to -- so
+            # this crashed as an opaque, unhandled 500 ("Error during
+            # analysis" in the frontend) instead of a real message, EVERY
+            # time this particular bbox tripped it (e.g. a hand-drawn
+            # boundary too small/large for the free API tier, or a spent
+            # daily quota). Wrapping it as RuntimeError here means every
+            # existing call site's `except RuntimeError` now actually catches
+            # it, with the real reason included.
+            body_snippet = e.response.text[:300] if e.response is not None else ""
+            raise RuntimeError(
+                f"OpenTopography DEM request failed ({e.response.status_code if e.response is not None else '?'}): "
+                f"{body_snippet or e}"
+            ) from e
+        except httpx.RequestError as e:
+            # Network-level failure: DNS, connection refused, or (very
+            # commonly for a larger bbox) the 60s timeout above being hit
+            # while OpenTopography is still generating the tile -- this is
+            # also the most likely explanation if requests feel "slow"
+            # right before failing.
+            raise RuntimeError(f"Could not reach OpenTopography (network error): {e}") from e
         cached_path.write_bytes(resp.content)
 
     return cached_path
