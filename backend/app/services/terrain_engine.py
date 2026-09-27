@@ -250,4 +250,4 @@ def generate_contours(
             )
 
     return contours
-```
+
