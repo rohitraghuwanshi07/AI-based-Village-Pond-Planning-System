@@ -1,6 +1,6 @@
 // Small wrapper around our FastAPI backend.
 // Change this if your backend runs on a different host/port.
-const API_BASE = "https://ai-based-village-pond-planning-system-3.onrender.com";;
+const API_BASE = "https://ai-based-village-pond-planning-system-3.onrender.com";
 
 async function searchVillage(name) {
   const url = `${API_BASE}/api/village/search?q=${encodeURIComponent(name)}`;
