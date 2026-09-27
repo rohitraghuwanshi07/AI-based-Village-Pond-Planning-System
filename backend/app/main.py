@@ -2,16 +2,18 @@
 Village Pond Planning System — API entrypoint.
 
 Run locally with:
-    uvicorn app.main:app --reload --port 8000
 
-Then open http://127.0.0.1:8000/docs for the auto-generated API docs
-(this doubles as your "API documentation" deliverable).
+    uvicorn app.main:app --reload --port 8000
 """
+
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.routers import village, rainfall, terrain, catchment, pond
+
 
 app = FastAPI(
     title="Village Pond Planning System",
@@ -19,32 +21,35 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Allow the frontend (served from a different port/origin during dev) to call this API.
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your frontend's actual origin before deploying
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/", tags=["system"])
-def root():
-    """Root endpoint — confirms the API is running."""
-    return {
-        "message": "Village Pond Planning System API is running",
-        "docs": "/docs",
-        "health": "/api/health",
-    }
-
-
 @app.get("/api/health", tags=["system"])
 def health_check():
     """Simple liveness check — confirms the server is up."""
-    return {"status": "ok", "service": "village-pond-planner"}
+    return {
+        "status": "ok",
+        "service": "village-pond-planner",
+    }
+
 
 app.include_router(village.router)
 app.include_router(rainfall.router)
 app.include_router(terrain.router)
 app.include_router(catchment.router)
 app.include_router(pond.router)
+
+
+frontend_dir = Path(__file__).resolve().parents[2] / "frontend"
+
+app.mount(
+    "/",
+    StaticFiles(directory=frontend_dir, html=True),
+    name="frontend",
+)
