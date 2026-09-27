@@ -224,9 +224,16 @@ function orderCornersByAngle(corners) {
 }
 
 map.on("click", async (e) => {
-  if (!isSelectingBoundary) return;
-
   const { lat, lng } = e.latlng;
+
+  if (!isSelectingBoundary) {
+    // Plain click anywhere on the map — no village search or boundary
+    // selection needed. Runs the exact same full analysis as clicking a
+    // ranked-site card, just for whatever point the user picked directly.
+    await analyzeAndRender(lat, lng, false);
+    return;
+  }
+
   boundaryCorners.push([lat, lng]);
 
   const marker = L.marker([lat, lng], {
