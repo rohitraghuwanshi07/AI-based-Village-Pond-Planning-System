@@ -87,7 +87,7 @@ def classify_suitability(slope_deg: np.ndarray, max_slope_deg: float = 8.0) -> n
     return slope_deg <= max_slope_deg
 
 
-def generate_contours(elevation: np.ndarray, transform, interval_m: float = 5.0) -> list[dict]:
+def generate_contours(elevation: np.ndarray, transform, interval_m: float = 10.0) -> list[dict]:
     """
     Extract contour lines from the elevation raster at a fixed interval.
 
