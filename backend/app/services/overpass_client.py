@@ -54,7 +54,7 @@ HEADERS = {
 
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "overpass_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_TTL_SECONDS = 3600  # 1 hour -- long enough to cover repeat testing of the same area
+CACHE_TTL_SECONDS = 2_592_000   # 1 hour -- long enough to cover repeat testing of the same area
 
 
 def _cache_path_for(query: str) -> Path:
