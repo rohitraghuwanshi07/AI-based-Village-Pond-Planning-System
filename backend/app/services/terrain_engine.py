@@ -1,4 +1,4 @@
-```python
+
 """
 Terrain engine: given a DEM GeoTIFF, compute slope (degrees) and extract
 contour lines as GeoJSON.
