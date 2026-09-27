@@ -22,7 +22,7 @@ async def analyze_terrain(
     north: float = Query(..., description="Northern latitude bound"),
     west: float = Query(..., description="Western longitude bound"),
     east: float = Query(..., description="Eastern longitude bound"),
-    contour_interval_m: float = Query(5.0, description="Contour line interval in meters"),
+    contour_interval_m: float = Query(10.0, description="Contour line interval in meters"),
     max_slope_deg: float = Query(8.0, description="Slope threshold (degrees) for 'suitable' land"),
 ):
     """
