@@ -1,0 +1,6 @@
+venv/
+backend/data/
+.git/
+.vercel/
+__pycache__/
+*.pyc
