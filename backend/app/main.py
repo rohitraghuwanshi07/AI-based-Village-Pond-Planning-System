@@ -6,11 +6,11 @@ Run locally with:
     uvicorn app.main:app --reload --port 8000
 """
 
-from pathlib import Path
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+
 
 from app.routers import village, rainfall, terrain, catchment, pond
 
@@ -45,11 +45,3 @@ app.include_router(terrain.router)
 app.include_router(catchment.router)
 app.include_router(pond.router)
 
-
-frontend_dir = Path(__file__).resolve().parents[2] / "frontend"
-
-app.mount(
-    "/",
-    StaticFiles(directory=frontend_dir, html=True),
-    name="frontend",
-)
