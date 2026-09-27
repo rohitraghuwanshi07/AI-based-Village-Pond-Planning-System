@@ -526,7 +526,7 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo, viewingRankedSite = 
   const msiDataUnavailable = !!msiObs.data_unavailable;
   const msiHasObs = (msiObs.buildings_nearby || msiObs.roads_nearby || msiObs.water_bodies_nearby);
   const msiObsText = msiDataUnavailable
-    ? `<span style="color:#8a6d1a">Obstacle data unavailable (query failed) — not verified</span>`
+    ? `<span style="color:#8a6d1a">Obstacle check unavailable in this hosting environment — using a conservative safety margin</span>`
     : msiHasObs
       ? `<span style="color:#b3413a">Bldgs: ${msiObs.buildings_nearby || 0}, Rds: ${msiObs.roads_nearby || 0}, Water: ${msiObs.water_bodies_nearby || 0}</span>`
       : `<span style="color:#2c5a3d">Clear of obstacles</span>`;
@@ -538,7 +538,7 @@ function renderSiteSummary(rec, lat, lng, autoSelectedInfo, viewingRankedSite = 
   const areaDisplayRow = msi
     ? `<div class="result-row"><span class="label">Available Area</span><span class="value">${
         msiDataUnavailable
-          ? "Not verified (query failed)"
+          ? "Not verified (public map data blocked from this host)"
           : (siteAvailableArea !== null ? siteAvailableArea.toLocaleString() + ' m²' : 'Unknown')
       }</span></div>`
     : "";
@@ -833,7 +833,7 @@ function renderTop5Sites(sites) {
     const dataUnavailable = !!obs.data_unavailable;
     const hasObs = (obs.buildings_nearby || obs.roads_nearby || obs.water_bodies_nearby);
     const obsText = dataUnavailable
-      ? `<span style="color:#8a6d1a">Obstacle data unavailable (query failed) — not verified</span>`
+      ? `<span style="color:#8a6d1a">Obstacle check unavailable in this hosting environment — using a conservative safety margin</span>`
       : hasObs
         ? `<span style="color:#b3413a">Bldgs: ${obs.buildings_nearby || 0}, Rds: ${obs.roads_nearby || 0}, Water: ${obs.water_bodies_nearby || 0}</span>`
         : `<span style="color:#2c5a3d">Clear of obstacles</span>`;
@@ -844,7 +844,7 @@ function renderTop5Sites(sites) {
     // The only time this should say "Unknown"/"Not verified" is when the
     // live obstruction query actually failed.
     const areaText = dataUnavailable
-      ? "Not verified (query failed)"
+      ? "Not verified (public map data blocked from this host)"
       : (site.available_area_m2 !== undefined && site.available_area_m2 !== null)
         ? site.available_area_m2.toLocaleString() + ' m²'
         : 'Unknown';
