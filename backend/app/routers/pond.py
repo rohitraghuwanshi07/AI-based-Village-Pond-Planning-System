@@ -37,9 +37,8 @@ from app.services.runoff_engine import (
     CURVE_NUMBERS,
 )
 from app.services.pond_sizing_engine import recommend_pond
-from app.services.land_use_client import fetch_obstructions, fetch_water_bodies_in_bbox
-from app.services.ownership_client import fetch_ownership_zones
-from app.services.site_suitability import find_eligible_patches, find_eligible_patches_from_parcels, find_vacant_patches
+from app.services.land_use_client import fetch_water_bodies_in_bbox
+from app.services.site_suitability import find_eligible_patches_from_parcels
 from app.services.soil_client import fetch_soil_composition
 from app.services.elevation_client import fetch_dem
 from app.services.terrain_engine import load_dem, compute_slope_degrees, pixel_size_meters
@@ -49,6 +48,11 @@ from app.services.land_record_parser import parse_land_record_file
 from app.routers.catchment import delineate as delineate_catchment_endpoint
 
 router = APIRouter(prefix="/api/pond", tags=["pond"])
+
+# Live Available Lands / OSM ownership checks are disabled.
+# When the caller does not provide a site area, this planning value is used
+# only for pond sizing; it is NOT a claim that the land is legally available.
+DEFAULT_PLANNING_SITE_AREA_M2 = 1000.0
 
 
 async def _fetch_water_polygons(south: float, north: float, west: float, east: float) -> list:
@@ -161,180 +165,69 @@ async def _full_recommendation(
     rainfall_years: int,
     auto_selected_info: dict | None = None,
 ):
-    """Shared pipeline used by both /recommend (manual point) and
-    /suggest-site (auto-detected point)."""
+    """Shared pipeline used by /recommend and /suggest-site.
+
+    Live Available Lands / OSM ownership and vacancy checks are intentionally
+    disabled.  A caller-provided site area is used directly; when no area is
+    supplied, a planning area is used only for pond sizing.  Automatic site
+    selection still uses elevation, drainage, slope, and water-body exclusion.
+    """
     curve_number = CURVE_NUMBERS.get(land_cover, DEFAULT_CURVE_NUMBER)
 
-    # Parallelize independent high-latency tasks:
-    # 1. Catchment delineation
-    # 2. Historical rainfall
-    # 3. Land ownership/obstruction check
-    # 4. Soil composition
-    
+    # Catchment, rainfall, and soil are the only per-site network tasks here.
+    # No live ownership/Available Lands/Overpass query is made.
     tasks = [
-        delineate_catchment_endpoint(south=south, north=north, west=west, east=east, pour_lat=pour_lat, pour_lon=pour_lon),
+        delineate_catchment_endpoint(
+            south=south, north=north, west=west, east=east,
+            pour_lat=pour_lat, pour_lon=pour_lon,
+        ),
         get_historical_rainfall(pour_lat, pour_lon, years=rainfall_years),
         fetch_soil_composition(pour_lat, pour_lon),
     ]
 
-    # Add land check tasks based on whether area was provided
-    if available_site_area_m2 is None:
-        tasks.append(fetch_obstructions(pour_lat, pour_lon, radius_m=150.0))
-        tasks.append(fetch_ownership_zones(pour_lat, pour_lon, radius_m=150.0))
-    else:
-        # manual area provided, only check obstructions
-        tasks.append(fetch_obstructions(pour_lat, pour_lon, radius_m=150.0))
-
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Unpack results with error handling
+
     catchment_result = results[0]
     rainfall_result = results[1]
     soil_check = results[2]
-    
+
     if isinstance(catchment_result, Exception):
         raise HTTPException(status_code=500, detail=f"Catchment delineation failed: {catchment_result}")
     if isinstance(rainfall_result, Exception):
-        # Fallback for rainfall if it fails -- clearly flagged regional
-        # estimate, not a silent 0 mm/yr (see fallback_rainfall_result's
-        # docstring for why that distinction matters).
         rainfall_result = fallback_rainfall_result(pour_lat, pour_lon)
     if isinstance(soil_check, Exception):
         soil_check = {"query_succeeded": False, "note": f"Soil check failed: {soil_check}"}
 
-    # Process Catchment
     catchment_area_m2 = catchment_result["catchment_area_m2"]
-
-    # Process Rainfall & Runoff
     rainfall_data_unavailable = rainfall_result.get("data_unavailable", False)
     avg_annual_runoff_depth_mm, avg_annual_runoff_volume_m3 = _runoff_from_rainfall(
         rainfall_result, curve_number, catchment_area_m2,
     )
 
-    # Process Land Check (Ownership/Obstructions)
-    site_check = None
+    # Live Available Lands / ownership checks are disabled.
+    # Use a supplied planning area, or a fixed planning value when omitted.
+    if available_site_area_m2 is None:
+        available_site_area_m2 = DEFAULT_PLANNING_SITE_AREA_M2
+        area_source = "default planning area (live Available Lands check disabled)"
+    else:
+        area_source = "manually supplied site area"
+
+    data_unavailable = rainfall_data_unavailable
+    site_check = {
+        "available_area_m2": available_site_area_m2,
+        "source": area_source,
+        "ownership_checked": False,
+        "live_available_lands_check": False,
+        "note": (
+            "Live land ownership/availability verification is disabled. "
+            "The area shown here is a planning value and must be verified "
+            "against official land records before construction."
+        ),
+    }
     selected_patch = None
     ownership_layers = None
-    # True whenever available_site_area_m2 ends up 0 (or capped/unverified)
-    # because a live query FAILED, not because the site was actually checked
-    # and found to have no room -- see recommend_pond's docstring for why
-    # that distinction matters for the message shown. Rainfall failure is
-    # folded in here too: a failed rainfall fetch is just as much "we
-    # couldn't check" as a failed obstruction/ownership fetch, so it should
-    # get the same "data unavailable" framing wherever it affects downstream
-    # numbers, rather than only being caveated in the rainfall block.
-    data_unavailable = rainfall_data_unavailable
 
-    if available_site_area_m2 is None:
-        obstruction_data = results[3]
-        ownership_data = results[4]
-        
-        if isinstance(obstruction_data, Exception):
-            obstruction_data = {"query_succeeded": False, "error": str(obstruction_data)}
-        if isinstance(ownership_data, Exception):
-            ownership_data = {"query_succeeded": False, "error": str(ownership_data)}
-
-        if obstruction_data.get("query_succeeded") and ownership_data.get("query_succeeded"):
-            patch_result = find_eligible_patches(
-                pour_lat, pour_lon,
-                buildings=obstruction_data["buildings"],
-                roads=obstruction_data["roads"],
-                water=obstruction_data["water"],
-                government_zones=ownership_data["government_zones"],
-                private_zones=ownership_data["private_zones"],
-                search_radius_m=150.0,
-            )
-            ownership_layers = patch_result["layer_boundaries"]
-            if patch_result["patches"] and patch_result["selected_patch_index"] is not None:
-                selected_patch = patch_result["patches"][patch_result["selected_patch_index"]]
-                available_site_area_m2 = selected_patch["area_m2"]
-            else:
-                available_site_area_m2 = 0.0
-            site_check = {
-                "available_area_m2": available_site_area_m2,
-                "area_breakdown": patch_result["area_breakdown"],
-                "total_separate_eligible_patches_found": len(patch_result["patches"]),
-                "government_zones_found_nearby": patch_result["government_zones_found_nearby"],
-                "private_zones_found_nearby": patch_result["private_zones_found_nearby"],
-                "buildings_found_nearby": patch_result["buildings_found_nearby"],
-                "roads_found_nearby": patch_result["roads_found_nearby"],
-                "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
-                "limitation": patch_result["ownership_data_limitation"],
-            }
-        else:
-            failed_reasons = []
-            if not obstruction_data.get("query_succeeded"):
-                failed_reasons.append(f"obstruction check failed ({obstruction_data.get('error')})")
-            if not ownership_data.get("query_succeeded"):
-                failed_reasons.append(f"ownership check failed ({ownership_data.get('error')})")
-            available_site_area_m2 = 0.0
-            data_unavailable = True
-            site_check = {
-                "available_area_m2": 0.0,
-                "note": (
-                    f"Could not verify land ownership/availability ({'; '.join(failed_reasons)}). "
-                    f"Per a strict policy, unverifiable land is not assumed available -- "
-                    f"0 m2 eligible area is reported rather than a guess. Retry, or verify "
-                    f"this site manually through official government land records."
-                ),
-            }
-    else:
-        obstruction_data = results[3]
-        if isinstance(obstruction_data, Exception):
-            obstruction_data = {"query_succeeded": False, "error": str(obstruction_data)}
-
-        if obstruction_data.get("query_succeeded"):
-            patch_result = find_vacant_patches(
-                pour_lat, pour_lon,
-                buildings=obstruction_data["buildings"],
-                roads=obstruction_data["roads"],
-                water=obstruction_data["water"],
-                search_radius_m=150.0,
-            )
-            if patch_result["patches"] and patch_result["selected_patch_index"] is not None:
-                selected_patch = patch_result["patches"][patch_result["selected_patch_index"]]
-                real_vacant_area = selected_patch["area_m2"]
-                manually_entered = available_site_area_m2
-                available_site_area_m2 = min(available_site_area_m2, real_vacant_area)
-                site_check = {
-                    "available_area_m2": available_site_area_m2,
-                    "manually_entered_area_m2": manually_entered,
-                    "real_vacant_patch_area_m2": real_vacant_area,
-                    "buildings_found_nearby": patch_result["buildings_found_nearby"],
-                    "roads_found_nearby": patch_result["roads_found_nearby"],
-                    "water_bodies_found_nearby": patch_result["water_bodies_found_nearby"],
-                    "note": (
-                        f"Your manually entered area ({manually_entered:.0f} m2) was checked against "
-                        f"real nearby buildings/roads/water bodies and capped to "
-                        f"{available_site_area_m2:.0f} m2 (ownership was NOT checked -- clear the "
-                        f"manual area field to enable the full ownership check)."
-                    ),
-                }
-            else:
-                manually_entered = available_site_area_m2
-                available_site_area_m2 = 0.0
-                site_check = {
-                    "available_area_m2": 0.0,
-                    "manually_entered_area_m2": manually_entered,
-                    "note": (
-                        f"This point appears fully occupied by buildings/roads/water bodies -- "
-                        f"your manually entered {manually_entered:.0f} m2 has been overridden to "
-                        f"0 m2. Try a different location."
-                    ),
-                }
-        else:
-            site_check = {
-                "available_area_m2": available_site_area_m2,
-                "note": (
-                    f"Using your manually entered area ({available_site_area_m2:.0f} m2) as-is -- "
-                    f"the automatic building/road/water check failed "
-                    f"({obstruction_data.get('error', 'unknown error')}), so this number has NOT "
-                    f"been verified against real obstructions. Please confirm on satellite imagery "
-                    f"before construction."
-                ),
-            }
-
-    # 5. Pond sizing recommendation
+    # Pond sizing recommendation
     pond_result = recommend_pond(
         required_volume_m3=avg_annual_runoff_volume_m3,
         available_site_area_m2=available_site_area_m2,
@@ -342,57 +235,42 @@ async def _full_recommendation(
         data_unavailable=data_unavailable,
     )
 
-    # 6. Scoring + plain-language explanation for the site actually being
-    # shown here -- computed regardless of whether this is a fresh manual
-    # click or "View Full Analysis" on an already-ranked site. It used to
-    # only run for a genuinely fresh manual click (auto_selected_info is
-    # None), which meant clicking into a ranked site's "View Full Analysis"
-    # lost its whole explanation/obstacle breakdown even though the ranked
-    # list it came from had shown exactly that -- the detail view looked
-    # like a downgrade from the list it was opened from.
+    # Scoring + plain-language explanation for the site actually being shown.
     manual_score_info = None
     if "terrain_at_snapped_point" in catchment_result:
         terrain = catchment_result["terrain_at_snapped_point"]
-        # Same normalization logic as pond_site_selector
         elev_range = max(terrain["elevation_max"] - terrain["elevation_min"], 1e-9)
         norm_elev = 1.0 - (terrain["elevation_m"] - terrain["elevation_min"]) / elev_range
-        
         acc_range = max(terrain["accumulation_max"] - 0, 1e-9)
         norm_acc = terrain["accumulation"] / acc_range
-        
         slope_range = max(terrain["slope_max"] - terrain["slope_min"], 1e-9)
         norm_slope = 1.0 - (terrain["slope_deg"] - terrain["slope_min"]) / slope_range
 
         elevation_weight, accumulation_weight, slope_weight = 0.40, 0.25, 0.15
         total_weight = elevation_weight + accumulation_weight + slope_weight
-        
-        composite = (elevation_weight * norm_elev + accumulation_weight * norm_acc + slope_weight * norm_slope) / total_weight
+        composite = (
+            elevation_weight * norm_elev
+            + accumulation_weight * norm_acc
+            + slope_weight * norm_slope
+        ) / total_weight
         raw_score = composite * 100.0
-
         scores = {
             "elevation_score": round(norm_elev * 100, 1),
             "accumulation_score": round(norm_acc * 100, 1),
-            "slope_score": round(norm_slope * 100, 1)
+            "slope_score": round(norm_slope * 100, 1),
         }
-        
-        buildings_nearby = site_check.get("buildings_found_nearby", 0) if site_check else 0
-        roads_nearby = site_check.get("roads_found_nearby", 0) if site_check else 0
-        water_bodies_nearby = site_check.get("water_bodies_found_nearby", 0) if site_check else 0
-
-        penalty = 0 if data_unavailable else (buildings_nearby * 5) + (roads_nearby * 10) + (water_bodies_nearby * 15)
-        final_score = max(0, raw_score - penalty)
-
         nearby = {
-            "buildings_nearby": buildings_nearby,
-            "roads_nearby": roads_nearby,
-            "water_bodies_nearby": water_bodies_nearby,
+            "buildings_nearby": 0,
+            "roads_nearby": 0,
+            "water_bodies_nearby": 0,
             "data_unavailable": data_unavailable,
         }
+        final_score = raw_score
         rank_label = auto_selected_info["rank"] if auto_selected_info and auto_selected_info.get("rank") else "Manual"
         explanation = _generate_rank_explanation(
-            rank_label, scores, nearby, final_score, raw_score=raw_score, data_unavailable=data_unavailable,
+            rank_label, scores, nearby, final_score,
+            raw_score=raw_score, data_unavailable=data_unavailable,
         )
-
         manual_score_info = {
             "raw_score": round(raw_score, 1),
             "composite_score": round(final_score, 1),
@@ -403,8 +281,8 @@ async def _full_recommendation(
 
     return {
         "location": {"lat": pour_lat, "lon": pour_lon},
-        "vacant_land_boundary_geojson": selected_patch["boundary_geojson"] if selected_patch else None,
-        "ownership_layers": ownership_layers,
+        "vacant_land_boundary_geojson": None,
+        "ownership_layers": None,
         "auto_selected": auto_selected_info,
         "manual_score_info": manual_score_info,
         "catchment": {
@@ -550,8 +428,9 @@ async def suggest_top_sites(
 ):
     """
     Finds and ranks the top N candidate pond sites within a search area.
-    Explicitly excludes sites on or near existing water bodies. Each ranked
-    site also gets its own recommended pond size (depth + surface area),
+    Explicitly excludes sites on or near existing water bodies. Live Available
+    Lands/ownership/vacancy checks are disabled. Each ranked site also gets
+    its own recommended pond size (depth + surface area),
     sized from that site's own catchment/runoff -- not just its eligible
     land area -- so the "sub-boundary" shown for each rank reflects how big
     that pond should actually be, not just how much land happens to be free.
@@ -672,13 +551,6 @@ async def suggest_top_sites(
     if not candidates:
         raise HTTPException(status_code=404, detail="No suitable pond sites found in this area.")
 
-    # Fetch all obstructions in bulk for the candidates
-    from app.services.land_use_client import fetch_obstructions_bulk
-    from shapely.geometry import Point
-    
-    cand_coords = [(c["lat"], c["lon"]) for c in candidates]
-    bulk_obs = await fetch_obstructions_bulk(cand_coords, radius_m=150.0)
-
     # Delineate each candidate's own catchment. fill_depressions/flow_direction/
     # flow_accumulation depend only on the DEM (not on which candidate point
     # we're delineating from), and were ALREADY computed above for site
@@ -737,64 +609,21 @@ async def suggest_top_sites(
     # Lightweight suitability check for each candidate
     def process_candidate_sync(cand, catchment_result):
         lat, lon = cand["lat"], cand["lon"]
-        center = Point(lon, lat)
-        
-        # Filter bulk observations to just this candidate's 150m radius
-        # (approximate degree conversion for filtering: 150m is ~0.0014 degrees)
-        radius_deg = 150.0 / 111320.0
-        
-        local_bldgs = [b for b in bulk_obs["buildings"] if b.distance(center) <= radius_deg]
-        local_roads = [r for r in bulk_obs["roads"] if r.distance(center) <= radius_deg]
-        local_water = [w for w in bulk_obs["water"] if w.distance(center) <= radius_deg]
-        
-        obs_local = {
-            "buildings": local_bldgs,
-            "roads": local_roads,
-            "water": local_water,
-            "query_succeeded": bulk_obs.get("query_succeeded", False)
-        }
 
-        buildings_nearby = len(local_bldgs)
-        roads_nearby = len(local_roads)
-        water_bodies_nearby = len(local_water)
-
-        # Distinguish "we checked and there's genuinely nothing nearby" from
-        # "the live Overpass query failed, so these are placeholder zeros" --
-        # the two produce identical counts (0/0/0) but mean opposite things
-        # for whether it's safe to trust "0 obstacles" as good news. A
-        # failed rainfall fetch (rainfall_data_unavailable, from the outer
-        # scope) is the same kind of "we couldn't check" and folds in here
-        # too, since it also feeds this candidate's pond_sizing below.
-        data_unavailable = (not obs_local["query_succeeded"]) or rainfall_data_unavailable
-
-        available_area = 0.0
+        # Live Available Lands / vacancy checks are disabled.
+        # Use a planning area solely for pond sizing.
+        available_area = DEFAULT_PLANNING_SITE_AREA_M2
         vacant_geojson = None
-        if obs_local["query_succeeded"]:
-            patch_res = find_vacant_patches(
-                lat, lon, local_bldgs, local_roads, local_water,
-                search_radius_m=150.0
-            )
-            if patch_res["patches"] and patch_res["selected_patch_index"] is not None:
-                sel_patch = patch_res["patches"][patch_res["selected_patch_index"]]
-                available_area = sel_patch["area_m2"]
-                vacant_geojson = sel_patch["boundary_geojson"]
-
         nearby = {
-            "buildings_nearby": buildings_nearby,
-            "roads_nearby": roads_nearby,
-            "water_bodies_nearby": water_bodies_nearby,
-            "data_unavailable": data_unavailable,
+            "buildings_nearby": 0,
+            "roads_nearby": 0,
+            "water_bodies_nearby": 0,
+            "data_unavailable": rainfall_data_unavailable,
         }
 
         raw_score = cand["composite_score"]
-        penalty = 0 if data_unavailable else (buildings_nearby * 5) + (roads_nearby * 10) + (water_bodies_nearby * 15)
-        final_score = max(0, raw_score - penalty)
+        final_score = raw_score
 
-        # Recommend an actual pond size (depth + surface area) for this
-        # specific site, from ITS OWN catchment -- not just how much land is
-        # free. This is the "sub-boundary" shown for each ranked site: the
-        # available-land patch above is how much room there is; this is how
-        # big the pond itself should actually be within that room.
         if isinstance(catchment_result, Exception) or catchment_result is None:
             pond_sizing = {
                 "cannot_recommend": True,
@@ -806,7 +635,10 @@ async def suggest_top_sites(
         else:
             catchment_area_m2 = catchment_result["catchment_area_m2"]
             runoff_volume_m3 = (avg_annual_runoff_depth_mm / 1000) * catchment_area_m2
-            pond_sizing = recommend_pond(runoff_volume_m3, available_area, target_capture_fraction, data_unavailable=data_unavailable)
+            pond_sizing = recommend_pond(
+                runoff_volume_m3, available_area, target_capture_fraction,
+                data_unavailable=rainfall_data_unavailable,
+            )
 
         return {
             "rank": cand["rank"],
@@ -819,7 +651,7 @@ async def suggest_top_sites(
             "vacant_land_boundary_geojson": vacant_geojson,
             "catchment_area_m2": catchment_area_m2,
             "pond_sizing": pond_sizing,
-            "selection_info": cand["selection_info"]
+            "selection_info": cand["selection_info"],
         }
 
     ranked_sites = [process_candidate_sync(c, catchment_result) for c, catchment_result in zip(candidates, catchment_results)]
