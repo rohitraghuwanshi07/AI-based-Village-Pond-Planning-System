@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 
-from app.routers import village, rainfall, terrain, catchment, pond
+from app.routers import village, rainfall, terrain, catchment, pond, contour
 
 
 app = FastAPI(
@@ -44,4 +44,4 @@ app.include_router(rainfall.router)
 app.include_router(terrain.router)
 app.include_router(catchment.router)
 app.include_router(pond.router)
-
+app.include_router(contour.router)
